@@ -6,7 +6,7 @@
 FileStorage is an embedded, LSM-inspired storage engine optimized for high-throughput writes and low-latency lookups. It leverages Memory-Mapped Files (MMF) and Write-Ahead Logging (WAL) to balance extreme performance with crash resilience.
 🏗 Solution Structure
 Plaintext
-
+```
 FileStorage.sln 
 ├── FileStorage.Abstractions/   # Domain contracts & interfaces (IDatabase, ITable)
 ├── FileStorage.Application/    # High-level logic, TableManager, and API Orchestration
@@ -14,7 +14,7 @@ FileStorage.sln
 ├── Samples.ConsoleApp/         # Comprehensive CLI demo: CRUD, Indexes, Compaction
 ├── Samples.API/                # Minimal API integration & Dependency Injection example
 └── Tests/                      # Unit, Integration, and Crash-Resilience tests
-
+```
 ⚡ Key Features
 Feature	Technical Implementation
 Async-Native	Full IAsyncEnumerable support for non-blocking data streaming.
@@ -24,7 +24,7 @@ Probabilistic Lookups	Integrated Bloom Filters to prevent unnecessary disk I/O.
 Atomic Compaction	Manifest-based "Shadow Paging" protocol for safe data merging.
 Memory Efficiency	Zero-copy serialization using BinaryPrimitives and ArrayPool.
 🚀 Quick Start
-C#
+```C#
 
 // Initialize the engine via Provider (Dependency Injection ready)
 await using var provider = new FileStorageProvider("Data/FileStorage.db");
@@ -47,7 +47,7 @@ await foreach (var record in activeUsers)
     // record.Data is handled efficiently via internal buffer pooling
     Console.WriteLine($"Found active user: {record.Key}");
 }
-
+```
 🧠 Architecture & AI Context
 
 FileStorage is designed for high-concurrency environments where write-amplification must be minimized and read-performance must scale.
