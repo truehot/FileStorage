@@ -1,11 +1,12 @@
-📦 FileStorage
+### 📦 FileStorage
 
-    [!CAUTION]
-    NOT FOR PRODUCTION USE > This library is under active development. API signatures, disk formats, and internal behaviors (including WAL and Indexing) are subject to breaking changes. Targeting .NET 9.
+> [!CAUTION]
+> NOT FOR PRODUCTION USE > This library is under active development. API signatures, disk formats, and internal behaviors (including WAL and Indexing) are subject to breaking changes. Targeting .NET 9.
 
 FileStorage is an embedded, LSM-inspired storage engine optimized for high-throughput writes and low-latency lookups. It leverages Memory-Mapped Files (MMF) and Write-Ahead Logging (WAL) to balance extreme performance with crash resilience.
-🏗 Solution Structure
-Plaintext
+
+### 🏗 Solution Structure
+
 ```
 FileStorage.sln 
 ├── FileStorage.Abstractions/   # Domain contracts & interfaces (IDatabase, ITable)
@@ -15,7 +16,7 @@ FileStorage.sln
 ├── Samples.API/                # Minimal API integration & Dependency Injection example
 └── Tests/                      # Unit, Integration, and Crash-Resilience tests
 ```
-⚡ Key Features
+###⚡ Key Features
 Feature	Technical Implementation
 Async-Native	Full IAsyncEnumerable support for non-blocking data streaming.
 Crash-Resilience	Monotonic Sequence Numbers + WAL journal with mandatory CRC32C.
@@ -23,7 +24,8 @@ Fast Indexing	Persistent LSM-tree based secondary indexes for complex queries.
 Probabilistic Lookups	Integrated Bloom Filters to prevent unnecessary disk I/O.
 Atomic Compaction	Manifest-based "Shadow Paging" protocol for safe data merging.
 Memory Efficiency	Zero-copy serialization using BinaryPrimitives and ArrayPool.
-🚀 Quick Start
+
+### 🚀 Quick Start
 ```C#
 
 // Initialize the engine via Provider (Dependency Injection ready)
@@ -48,59 +50,60 @@ await foreach (var record in activeUsers)
     Console.WriteLine($"Found active user: {record.Key}");
 }
 ```
-🧠 Architecture & AI Context
+### 🧠 Architecture
 
 FileStorage is designed for high-concurrency environments where write-amplification must be minimized and read-performance must scale.
-📦 Storage Engine & Persistence
 
-    Append-only Logging: High-performance data ingestion with background Compaction and Shadow Paging for safe, atomic file merging.
+### 📦 Storage Engine & Persistence
 
-    Mmap-Powered I/O: Utilizes memory-mapped regions (MmapRegion) for zero-copy access and atomic point-in-time views for concurrent readers at the file level.
+Append-only Logging: High-performance data ingestion with background Compaction and Shadow Paging for safe, atomic file merging.
 
-    Write-Ahead Log (WAL): Ensures strict durability via FlushFileBuffers (Win32) / fsync (POSIX) to prevent data loss.
+Mmap-Powered I/O: Utilizes memory-mapped regions (MmapRegion) for zero-copy access and atomic point-in-time views for concurrent readers at the file level.
 
-🛡️ Data Integrity & Recovery
+Write-Ahead Log (WAL): Ensures strict durability via FlushFileBuffers (Win32) / fsync (POSIX) to prevent data loss.
 
-    Per-record CRC32C: Hardware-accelerated validation to detect "Torn Writes" or bit rot at the storage level.
+### 🛡️ Data Integrity & Recovery
 
-    Crash Resilience: Automated recovery through WAL replay and checkpointing, ensuring state consistency after unexpected shutdowns.
+Per-record CRC32C: Hardware-accelerated validation to detect "Torn Writes" or bit rot at the storage level.
 
-⚡ Performance & Concurrency
+Crash Resilience: Automated recovery through WAL replay and checkpointing, ensuring state consistency after unexpected shutdowns.
 
-    Zero-Copy Pipeline: Deep integration of Span<T>, Memory<T>, and ArrayPool<byte> to eliminate GC pressure and redundant allocations.
+###⚡ Performance & Concurrency
 
-    Non-blocking I/O: Orchestrates background tasks using System.Threading.Channels and lease-based locking for thread-safe coordination.
+Zero-Copy Pipeline: Deep integration of Span<T>, Memory<T>, and ArrayPool<byte> to eliminate GC pressure and redundant allocations.
 
-    Lock-free Reads: Provides consistent file-level access for readers, ensuring they always see a valid state without contention with active writers.
+Non-blocking I/O: Orchestrates background tasks using System.Threading.Channels and lease-based locking for thread-safe coordination.
+
+Lock-free Reads: Provides consistent file-level access for readers, ensuring they always see a valid state without contention with active writers.
 
 🛠 Key Components
 
-    MmapRegion: Manages memory-mapped file segments with automatic growth and snapshot-based access safety.
+MmapRegion: Manages memory-mapped file segments with automatic growth and snapshot-based access safety.
 
-    WAL (Write-Ahead Log): The "Source of Truth" for all write operations, used for reconstruction of the index state.
+WAL (Write-Ahead Log): The "Source of Truth" for all write operations, used for reconstruction of the index state.
 
-    IndexManager: Coordinates primary and LSM-tree based secondary indexes for optimized lookups.
+IndexManager: Coordinates primary and LSM-tree based secondary indexes for optimized lookups.
 
-    CompactionService: Handles background merging of fragmented data files to reclaim space via shadow paging.
+CompactionService: Handles background merging of fragmented data files to reclaim space via shadow paging.
 
-    BloomFilter: A probabilistic data structure that speeds up queries by quickly ruling out non-existent keys in secondary indexes.
+BloomFilter: A probabilistic data structure that speeds up queries by quickly ruling out non-existent keys in secondary indexes.
 
-    FileStorageProvider: The main entry point for Dependency Injection and lifecycle management.
+FileStorageProvider: The main entry point for Dependency Injection and lifecycle management.
 
-⚠️ Limitations & Roadmap
+### ⚠️ Limitations & Roadmap
 
-    No Multi-operation Transactions: ACID isolation is limited to single-record operations. Does not implement multi-operation snapshot isolation (MVCC).
+No Multi-operation Transactions: ACID isolation is limited to single-record operations. Does not implement multi-operation snapshot isolation (MVCC).
 
-    Single-Node Engine: Designed as an embedded database; not suitable for distributed/clustered environments.
+Single-Node Engine: Designed as an embedded database; not suitable for distributed/clustered environments.
 
-    Experimental API: Internal structures and disk formats are subject to change during the active development phase.
+Experimental API: Internal structures and disk formats are subject to change during the active development phase.
 
-📂 Samples & Evaluation
+### 📂 Samples & Evaluation
 
-    Samples.ConsoleApp: A deep dive into core engine capabilities, including manual compaction triggers and index rebuilding.
+Samples.ConsoleApp: A deep dive into core engine capabilities, including manual compaction triggers and index rebuilding.
 
-    Samples.Api: Demonstrates how to register FileStorage in a DI container using .AddFileStorage() and use it within controllers.
+Samples.Api: Demonstrates how to register FileStorage in a DI container using .AddFileStorage() and use it within controllers.
 
-📄 License
+### 📄 License
 
 Distributed under the MIT License. See LICENSE for more information.
