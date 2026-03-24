@@ -16,14 +16,15 @@ FileStorage.sln
 ├── Samples.API/                # Minimal API integration & Dependency Injection example
 └── Tests/                      # Unit, Integration, and Crash-Resilience tests
 ```
-###⚡ Key Features
-Feature	Technical Implementation
-Async-Native	Full IAsyncEnumerable support for non-blocking data streaming.
-Crash-Resilience	Monotonic Sequence Numbers + WAL journal with mandatory CRC32C.
-Fast Indexing	Persistent LSM-tree based secondary indexes for complex queries.
-Probabilistic Lookups	Integrated Bloom Filters to prevent unnecessary disk I/O.
-Atomic Compaction	Manifest-based "Shadow Paging" protocol for safe data merging.
-Memory Efficiency	Zero-copy serialization using BinaryPrimitives and ArrayPool.
+### ⚡ Key Features
+
+Feature	Technical      Implementation
+* Async-Native    Full IAsyncEnumerable support for non-blocking data streaming.
+* Crash-Resilience    Monotonic Sequence Numbers + WAL journal with mandatory CRC32C.
+* Fast Indexing    Persistent LSM-tree based secondary indexes for complex queries.
+* Probabilistic Lookups    Integrated Bloom Filters to prevent unnecessary disk I/O.
+* Atomic Compaction    Manifest-based "Shadow Paging" protocol for safe data merging.
+* Memory Efficiency    Zero-copy serialization using BinaryPrimitives and ArrayPool.
 
 ### 🚀 Quick Start
 ```C#
@@ -68,7 +69,7 @@ Per-record CRC32C: Hardware-accelerated validation to detect "Torn Writes" or bi
 
 Crash Resilience: Automated recovery through WAL replay and checkpointing, ensuring state consistency after unexpected shutdowns.
 
-###⚡ Performance & Concurrency
+### ⚡ Performance & Concurrency
 
 Zero-Copy Pipeline: Deep integration of Span<T>, Memory<T>, and ArrayPool<byte> to eliminate GC pressure and redundant allocations.
 
@@ -76,7 +77,7 @@ Non-blocking I/O: Orchestrates background tasks using System.Threading.Channels 
 
 Lock-free Reads: Provides consistent file-level access for readers, ensuring they always see a valid state without contention with active writers.
 
-🛠 Key Components
+### 🛠 Key Components
 
 MmapRegion: Manages memory-mapped file segments with automatic growth and snapshot-based access safety.
 
@@ -90,7 +91,7 @@ BloomFilter: A probabilistic data structure that speeds up queries by quickly ru
 
 FileStorageProvider: The main entry point for Dependency Injection and lifecycle management.
 
-### ⚠️ Limitations & Roadmap
+### ⚠️ Limitations
 
 No Multi-operation Transactions: ACID isolation is limited to single-record operations. Does not implement multi-operation snapshot isolation (MVCC).
 
