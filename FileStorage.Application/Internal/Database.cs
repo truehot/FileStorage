@@ -1,4 +1,5 @@
 using FileStorage.Abstractions;
+using FileStorage.Application.Validator;
 using FileStorage.Infrastructure;
 
 namespace FileStorage.Application;
@@ -23,45 +24,79 @@ internal sealed class Database : IDatabase
     public ITable OpenTable(string name)
     {
         ThrowIfDisposed();
-        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        TableValidator.Validate(name);
         return _tableFactory.Create(name, _engine);
     }
 
-    public async Task<IReadOnlyList<string>> ListTablesAsync()
+    public async Task<IReadOnlyList<string>> ListTablesAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return await _engine.ListTablesAsync();
+        return await _engine.ListTablesAsync(cancellationToken);
     }
 
-    public async Task<bool> TableExistsAsync(string name)
+    public async Task<bool> TableExistsAsync(string name, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return await _engine.TableExistsAsync(name);
+        TableValidator.Validate(name);
+        return await _engine.TableExistsAsync(name, cancellationToken);
     }
 
-    public async Task<long> DropTableAsync(string name)
+    public async Task<long> DropTableAsync(string name, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return await _engine.DropTableAsync(name);
+        TableValidator.Validate(name);
+        return await _engine.DropTableAsync(name, cancellationToken);
     }
 
-    public async Task<long> CompactAsync(params string[] tables)
+    /// <summary>
+    /// Reclaims disk space by rewriting files without soft-deleted records.
+    /// Pass table names to compact selectively, or omit to compact all.
+    /// Uses atomic file rename — fully crash-safe.
+    /// </summary>
+    public async Task<long> CompactAsync(string[]? tables, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        return await _engine.CompactAsync(tables);
+        string[] tablesToProcess = tables ?? [];
+
+        foreach (var table in tablesToProcess)
+        {
+            TableValidator.Validate(table);
+        }
+
+        return await _engine.CompactAsync(tablesToProcess, cancellationToken);
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        if (_ownsEngine) _engine.Dispose();
+        Dispose(true);
+        GC.SuppressFinalize(this);
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        Dispose();
-        return ValueTask.CompletedTask;
+        await DisposeAsyncCore().ConfigureAwait(false);
+        Dispose(false); 
+        GC.SuppressFinalize(this);
+    }
+
+    private void Dispose(bool disposing)
+    {
+        if (_disposed) return;
+        if (disposing && _ownsEngine)
+        {
+            _engine.Dispose();
+        }
+        _disposed = true;
+    }
+
+    private async ValueTask DisposeAsyncCore()
+    {
+        if (_disposed) return;
+        if (_ownsEngine)
+        {
+            if (_engine is IAsyncDisposable ad) await ad.DisposeAsync().ConfigureAwait(false);
+            else _engine.Dispose();
+        }
     }
 
     private void ThrowIfDisposed()

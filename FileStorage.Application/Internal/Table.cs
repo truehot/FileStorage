@@ -20,11 +20,12 @@ internal sealed class Table : ITable
 
     internal Table(string name, IStorageEngine engine)
     {
+        ArgumentNullException.ThrowIfNull(name);
         Name = name;
         _engine = engine;
     }
 
-    public async Task SaveAsync(Guid key, string data)
+    public async Task SaveAsync(Guid key, string data, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(data))
             throw new ArgumentException("Data cannot be null or empty.", nameof(data));
@@ -33,7 +34,7 @@ internal sealed class Table : ITable
 
         try
         {
-            await _engine.SaveAsync(Name, key, bytes);
+            await _engine.SaveAsync(Name, key, bytes, cancellationToken);
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("maximum size"))
         {
@@ -42,7 +43,7 @@ internal sealed class Table : ITable
         }
     }
 
-    public async Task SaveAsync(Guid key, string data, IReadOnlyDictionary<string, string> indexedFields)
+    public async Task SaveAsync(Guid key, string data, IReadOnlyDictionary<string, string> indexedFields, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(data))
             throw new ArgumentException("Data cannot be null or empty.", nameof(data));
@@ -52,7 +53,7 @@ internal sealed class Table : ITable
 
         try
         {
-            await _engine.SaveAsync(Name, key, bytes, indexedFields);
+            await _engine.SaveAsync(Name, key, bytes, indexedFields, cancellationToken);
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("maximum size"))
         {
@@ -61,22 +62,27 @@ internal sealed class Table : ITable
         }
     }
 
-    public async Task<StorageRecord?> GetAsync(Guid key) =>
-        await _engine.GetByKeyAsync(Name, key);
+    public async Task<StorageRecord?> GetAsync(Guid key, CancellationToken cancellationToken = default) =>
+        await _engine.GetByKeyAsync(Name, key, cancellationToken);
 
-    public async Task DeleteAsync(Guid key) =>
-        await _engine.DeleteAsync(Name, key);
+    public async Task DeleteAsync(Guid key, CancellationToken cancellationToken = default) =>
+        await _engine.DeleteAsync(Name, key, cancellationToken);
 
     public async Task<List<StorageRecord>> FilterAsync(
         string? filterField = null,
         string? filterValue = null,
         int skip = 0,
-        int take = int.MaxValue)
+        int take = int.MaxValue, CancellationToken cancellationToken = default)
     {
+        if (skip < 0)
+            throw new ArgumentOutOfRangeException(nameof(skip), "Skip must be non-negative.");
+        if (take < 0)
+            throw new ArgumentOutOfRangeException(nameof(take), "Take must be non-negative.");
+
         // ── Fast path: use secondary index if available ──
         if (!string.IsNullOrEmpty(filterField) && !string.IsNullOrEmpty(filterValue))
         {
-            var keys = await _engine.LookupByIndexAsync(Name, filterField, filterValue);
+            var keys = await _engine.LookupByIndexAsync(Name, filterField, filterValue, cancellationToken);
             if (keys is not null)
             {
                 var result = new List<StorageRecord>();
@@ -86,7 +92,7 @@ internal sealed class Table : ITable
                 {
                     if (result.Count >= take) break;
 
-                    var record = await _engine.GetByKeyAsync(Name, key);
+                    var record = await _engine.GetByKeyAsync(Name, key, cancellationToken);
                     if (record is null) continue;
 
                     if (skipped < skip)
@@ -105,10 +111,10 @@ internal sealed class Table : ITable
         // ── Slow path: full scan with text matching ──
         if (string.IsNullOrEmpty(filterValue))
         {
-            return await _engine.GetByTableAsync(Name, skip, take);
+            return await _engine.GetByTableAsync(Name, skip, take, cancellationToken);
         }
 
-        var all = await _engine.GetByTableAsync(Name, skip: 0, take: int.MaxValue);
+        var all = await _engine.GetByTableAsync(Name, skip: 0, take: int.MaxValue, cancellationToken);
         var filtered = new List<StorageRecord>();
         int skippedSlow = 0;
 
@@ -136,7 +142,7 @@ internal sealed class Table : ITable
         string? filterValue = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var all = await _engine.GetByTableAsync(Name, skip: 0, take: int.MaxValue);
+        var all = await _engine.GetByTableAsync(Name, skip: 0, take: int.MaxValue, cancellationToken);
 
         if (string.IsNullOrEmpty(filterValue))
         {
@@ -163,10 +169,10 @@ internal sealed class Table : ITable
 
     // ── Index management ──
 
-    public async Task<TableInfo> GetTableInfoAsync()
+    public async Task<TableInfo> GetTableInfoAsync(CancellationToken cancellationToken = default)
     {
-        long count = await _engine.CountAsync(Name);
-        var indexes = await _engine.GetIndexesAsync(Name);
+        long count = await _engine.CountAsync(Name, cancellationToken);
+        var indexes = await _engine.GetIndexesAsync(Name, cancellationToken);
 
         return new TableInfo
         {
@@ -176,27 +182,27 @@ internal sealed class Table : ITable
         };
     }
 
-    public async Task DropIndexAsync(string fieldName)
+    public async Task DropIndexAsync(string fieldName, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(fieldName))
             throw new ArgumentException("Field name cannot be null or empty.", nameof(fieldName));
 
-        await _engine.DropIndexAsync(Name, fieldName);
+        await _engine.DropIndexAsync(Name, fieldName, cancellationToken);
     }
 
-    public async Task EnsureIndexAsync(string fieldName)
+    public async Task EnsureIndexAsync(string fieldName, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(fieldName))
             throw new ArgumentException("Field name cannot be null or empty.", nameof(fieldName));
 
-        await _engine.EnsureIndexAsync(Name, fieldName);
+        await _engine.EnsureIndexAsync(Name, fieldName, cancellationToken);
     }
 
-    public async Task<long> TruncateAsync() =>
-        await _engine.TruncateTableAsync(Name);
+    public async Task<long> TruncateAsync(CancellationToken cancellationToken = default) =>
+        await _engine.TruncateTableAsync(Name, cancellationToken);
 
-    public async Task<long> CountAsync() =>
-        await _engine.CountAsync(Name);
+    public async Task<long> CountAsync(CancellationToken cancellationToken = default) =>
+        await _engine.CountAsync(Name, cancellationToken);
 
     // ── Private helpers ──
 

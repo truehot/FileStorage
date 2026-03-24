@@ -11,6 +11,7 @@ using FileStorage.Infrastructure.Recovery;
 using FileStorage.Infrastructure.Serialization;
 using FileStorage.Infrastructure.WAL;
 using System.Buffers;
+using System.Threading;
 
 namespace FileStorage.Infrastructure;
 
@@ -71,9 +72,9 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     //  Write operations (exclusive lock)
     // ──────────────────────────────────────────────
 
-    public async Task InitializeAsync()
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireWriteLockAsync();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
 
         var result = _recovery.Initialize(
             _regions.IndexRegion, _regions.DataRegion, _wal, _memoryIndex, _indexManager);
@@ -86,9 +87,9 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
         ReplaySecondaryIndexes();
     }
 
-    public async Task SaveAsync(string table, Guid key, byte[] data)
+    public async Task SaveAsync(string table, Guid key, byte[] data, CancellationToken cancellationToken = default)
     {
-        await SaveAsync(table, key, data, new Dictionary<string, string>());
+        await SaveAsync(table, key, data, new Dictionary<string, string>(), cancellationToken);
     }
 
     /// <summary>
@@ -96,7 +97,7 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     /// Both primary index and secondary indexes are updated atomically:
     /// indexed fields are persisted in the WAL entry, so they survive crash recovery.
     /// </summary>
-    public async Task SaveAsync(string table, Guid key, byte[] data, IReadOnlyDictionary<string, string> indexedFields)
+    public async Task SaveAsync(string table, Guid key, byte[] data, IReadOnlyDictionary<string, string> indexedFields, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(table)) throw new ArgumentException("Table name required", nameof(table));
         ArgumentNullException.ThrowIfNull(data);
@@ -104,7 +105,7 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
 
         _indexManager.ValidateTableName(table);
 
-        using var _ = await _lock.AcquireWriteLockAsync();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
 
         var (dataOffset, indexOffset) = _indexManager.ApplySave(table, key, data);
 
@@ -129,9 +130,9 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     /// Uses <see cref="ISecondaryIndexManager.RemoveByKey"/> since the previously
     /// indexed values are not known at delete time.
     /// </summary>
-    public async Task DeleteAsync(string table, Guid key)
+    public async Task DeleteAsync(string table, Guid key, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireWriteLockAsync();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
 
         if (!_memoryIndex.TryGet(table, key, out long indexOffset)) return;
 
@@ -153,12 +154,12 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     /// Physical cleanup of index entries happens immediately in-memory;
     /// disk space is reclaimed by <see cref="CompactAsync"/>.
     /// </summary>
-    public async Task<long> DropTableAsync(string table)
+    public async Task<long> DropTableAsync(string table, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(table))
             throw new ArgumentException("Table name required", nameof(table));
 
-        using var _ = await _lock.AcquireWriteLockAsync();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
 
         long count = _memoryIndex.CountByTable(table);
         if (count == 0) return 0;
@@ -184,12 +185,12 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     /// A single WAL record marks all data as invalid for crash recovery.
     /// Disk space is reclaimed by <see cref="CompactAsync"/>.
     /// </summary>
-    public async Task<long> TruncateTableAsync(string table)
+    public async Task<long> TruncateTableAsync(string table, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(table))
             throw new ArgumentException("Table name required", nameof(table));
 
-        using var _ = await _lock.AcquireWriteLockAsync();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
 
         long count = _memoryIndex.CountByTable(table);
         if (count == 0) return 0;
@@ -209,9 +210,9 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
         return count;
     }
 
-    public async Task<long> CompactAsync(params string[] tables)
+    public async Task<long> CompactAsync(string[] tables, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireWriteLockAsync();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
 
         _checkpoint.ForceCheckpoint();
 
@@ -234,21 +235,21 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     // ──────────────────────────────────────────────
     //  Secondary index operations
     // ──────────────────────────────────────────────
-    public async Task DropIndexAsync(string table, string fieldName)
+    public async Task DropIndexAsync(string table, string fieldName, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireWriteLockAsync();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
         _secondaryIndex.DropIndex(table, fieldName);
     }
 
-    public async Task<IReadOnlyList<IndexDefinition>> GetIndexesAsync(string table)
+    public async Task<IReadOnlyList<IndexDefinition>> GetIndexesAsync(string table, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync();
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
         return _secondaryIndex.GetIndexes(table);
     }
 
-    public async Task<List<Guid>?> LookupByIndexAsync(string table, string fieldName, string value)
+    public async Task<List<Guid>?> LookupByIndexAsync(string table, string fieldName, string value, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync();
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
         if (!_secondaryIndex.HasIndex(table, fieldName))
             return null;
         return _secondaryIndex.Lookup(table, fieldName, value);
@@ -258,9 +259,9 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     //  Read operations (shared lock)
     // ──────────────────────────────────────────────
 
-    public async Task<StorageRecord?> GetByKeyAsync(string table, Guid key)
+    public async Task<StorageRecord?> GetByKeyAsync(string table, Guid key, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync();
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
 
         if (!_memoryIndex.TryGet(table, key, out long indexOffset)) return null;
 
@@ -279,9 +280,9 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     /// to saturate NVMe bandwidth. Each read uses its own buffer from ArrayPool.
     /// MmapRegion.Read is thread-safe under read lock (snapshot-based accessor).
     /// </summary>
-    public async Task<List<StorageRecord>> GetByTableAsync(string table, int skip = 0, int take = int.MaxValue)
+    public async Task<List<StorageRecord>> GetByTableAsync(string table, int skip = 0, int take = int.MaxValue, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync();
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
 
         var candidates = _memoryIndex.GetByTable(table, skip, take);
         if (candidates.Count == 0)
@@ -292,26 +293,26 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
             return ReadSequential(candidates, table);
 
         // Large result set — parallel reads
-        return await ReadParallelAsync(candidates, table, take);
+        return await ReadParallelAsync(candidates, table, take, cancellationToken);
     }
 
-    public async Task<long> CountAsync(string table)
+    public async Task<long> CountAsync(string table, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync();
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
         return _memoryIndex.CountByTable(table);
     }
 
-    public async Task<IReadOnlyList<string>> ListTablesAsync()
+    public async Task<IReadOnlyList<string>> ListTablesAsync(CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync();
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
         return _memoryIndex.GetTableNames();
     }
 
-    public async Task<bool> TableExistsAsync(string table)
+    public async Task<bool> TableExistsAsync(string table, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(table)) return false;
 
-        using var _ = await _lock.AcquireReadLockAsync();
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
         return _memoryIndex.TableExists(table);
     }
 
@@ -397,7 +398,7 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
     /// because it acquires a snapshot reference — concurrent readers never see a disposed accessor.
     /// </summary>
     private async Task<List<StorageRecord>> ReadParallelAsync(
-        IReadOnlyList<(Guid Key, long Offset)> candidates, string table, int take)
+        IReadOnlyList<(Guid Key, long Offset)> candidates, string table, int take, CancellationToken cancellationToken)
     {
         var result = new List<StorageRecord>(Math.Min(candidates.Count, take));
         int entrySize = _indexManager.EntrySize;
@@ -420,7 +421,7 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
                             _regions.IndexRegion, _regions.DataRegion, buf, indexOffset, table, k);
                     }
                     finally { ArrayPool<byte>.Shared.Return(buf, clearArray: true); }
-                });
+                }, cancellationToken);
             }
 
             var records = await Task.WhenAll(tasks);
@@ -436,12 +437,12 @@ internal sealed class StorageEngine : IStorageEngine, IDisposable
         return result;
     }
 
-    public async Task EnsureIndexAsync(string table, string fieldName)
+    public async Task EnsureIndexAsync(string table, string fieldName, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(fieldName))
             throw new ArgumentException("Field name required", nameof(fieldName));
 
-        using var _ = await _lock.AcquireWriteLockAsync();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
         _secondaryIndex.EnsureIndex(table, fieldName);
     }
 }

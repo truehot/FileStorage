@@ -14,23 +14,23 @@ public interface IDatabase : IAsyncDisposable, IDisposable
     /// <summary>
     /// Returns the names of all tables that contain at least one record.
     /// </summary>
-    Task<IReadOnlyList<string>> ListTablesAsync();
+    Task<IReadOnlyList<string>> ListTablesAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Returns <c>true</c> if the table exists and contains at least one record.
     /// </summary>
-    Task<bool> TableExistsAsync(string name);
+    Task<bool> TableExistsAsync(string name, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Drops an entire table by soft-deleting all its records.
     /// Returns the number of records removed.
     /// </summary>
-    Task<long> DropTableAsync(string name);
+    Task<long> DropTableAsync(string name, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Reclaims disk space by rewriting files without soft-deleted records.
     /// Pass table names to compact selectively, or omit to compact all.
     /// Uses atomic file rename — fully crash-safe.
     /// </summary>
-    Task<long> CompactAsync(params string[] tables);
+    Task<long> CompactAsync(string[]? tables = null, CancellationToken cancellationToken = default);
 }

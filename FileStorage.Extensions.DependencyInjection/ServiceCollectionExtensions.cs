@@ -1,3 +1,4 @@
+using FileStorage.Application;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace FileStorage.Extensions.DependencyInjection;

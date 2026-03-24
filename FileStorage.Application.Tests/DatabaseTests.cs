@@ -91,7 +91,7 @@ public class DatabaseTests
         var before = await table.CountAsync();
         var removed = await table.TruncateAsync();
         var after = await table.CountAsync();
-        var compacted = await db.CompactAsync("Temp");
+        var compacted = await db.CompactAsync(["Temp"]);
 
         // Assert
         Assert.Equal(2, before);

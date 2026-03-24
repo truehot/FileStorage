@@ -1,4 +1,4 @@
-﻿using FileStorage;
+﻿using FileStorage.Application;
 using System.Text;
 using System.Text.Json;
 
@@ -74,7 +74,7 @@ Console.WriteLine($"  Dropped {await db.DropTableAsync("Logs")} records");
 Console.WriteLine($"  'Logs' exists: {await db.TableExistsAsync("Logs")}");
 
 Console.WriteLine("\n=== Compact 'Users' ===");
-Console.WriteLine($"  Removed {await db.CompactAsync("Users")} dead records");
+Console.WriteLine($"  Removed {await db.CompactAsync(["Users"])} dead records");
 
 Console.WriteLine("\n=== Compact all ===");
 Console.WriteLine($"  Removed {await db.CompactAsync()} dead records");

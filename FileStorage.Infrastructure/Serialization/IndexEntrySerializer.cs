@@ -25,6 +25,13 @@ internal static class IndexEntrySerializer
 
     public static void Write(Span<byte> buffer, string table, Guid key, long dataOffset, int dataSize, long version)
     {
+        if (buffer.Length < EntryFixedSize)
+        {
+            throw new ArgumentException(
+                $"Buffer size {buffer.Length} is less than required {EntryFixedSize} bytes.",
+                nameof(buffer));
+        }
+
         buffer.Slice(0, EntryFixedSize).Clear();
 
         int tableByteCount = Encoding.UTF8.GetBytes(table.AsSpan(), buffer.Slice(TableDataOffset, MaxTableNameBytes));
@@ -72,6 +79,8 @@ internal static class IndexEntrySerializer
 
     public static bool TableEquals(ReadOnlySpan<byte> buffer, string table)
     {
+        if (buffer.Length < EntryFixedSize) return false;
+
         int tableLen = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(TableLenOffset));
         if (tableLen <= 0 || tableLen > MaxTableNameBytes) return false;
 
