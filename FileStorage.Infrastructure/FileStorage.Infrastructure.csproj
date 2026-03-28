@@ -8,12 +8,13 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="FileStorage.Application" />
-    <InternalsVisibleTo Include="FileStorage.Tests" />
+    <InternalsVisibleTo Include="FileStorage.Application.Tests" />
     <InternalsVisibleTo Include="FileStorage.Infrastructure.Tests" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="System.IO.Hashing" Version="9.0.3" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.3" />
   </ItemGroup>
 
   <ItemGroup>

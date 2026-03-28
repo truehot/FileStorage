@@ -30,7 +30,7 @@ internal sealed class SecondaryIndexManager : ISecondaryIndexManager, IDisposabl
     private readonly int _compactionThreshold;
     private readonly Lock _registryLock = new();
 
-    private readonly Dictionary<(string Table, string Field), FieldIndexState> _indexes = new();
+    private readonly Dictionary<(string Table, string Field), FieldIndexState> _indexes = [];
 
     private const string ManifestFileName = "compaction.manifest";
     private const string ManifestCompleteMarker = "COMPLETE";
@@ -106,6 +106,55 @@ internal sealed class SecondaryIndexManager : ISecondaryIndexManager, IDisposabl
             finally { state.Lock.ExitWriteLock(); }
 
             if (frozen is not null)
+                FlushAndCompact(table, field, state, frozen);
+        }
+    }
+
+    /// <summary>
+    /// Inserts indexed values for multiple records in one call.
+    /// Entries are grouped by field to reduce lock transitions and lookup overhead.
+    /// </summary>
+    public void PutRange(string table, IReadOnlyCollection<(Guid RecordKey, IReadOnlyDictionary<string, string> IndexedFields)> entries)
+    {
+        if (entries.Count == 0) return;
+
+        var grouped = new Dictionary<string, List<(string Value, Guid Key)>>(StringComparer.Ordinal);
+
+        foreach (var (recordKey, indexedFields) in entries)
+        {
+            foreach (var (field, value) in indexedFields)
+            {
+                if (!grouped.TryGetValue(field, out var list))
+                {
+                    list = [];
+                    grouped[field] = list;
+                }
+
+                list.Add((value, recordKey));
+            }
+        }
+
+        foreach (var (field, mappings) in grouped)
+        {
+            var state = GetState(table, field);
+            if (state is null) continue;
+
+            var frozenChunks = new List<SortedDictionary<string, List<Guid>>>();
+
+            state.Lock.EnterWriteLock();
+            try
+            {
+                foreach (var (value, key) in mappings)
+                {
+                    state.MemTable.Put(value, key);
+
+                    if (state.MemTable.TotalMappings >= _flushThreshold)
+                        frozenChunks.Add(state.MemTable.Freeze());
+                }
+            }
+            finally { state.Lock.ExitWriteLock(); }
+
+            foreach (var frozen in frozenChunks)
                 FlushAndCompact(table, field, state, frozen);
         }
     }
@@ -188,25 +237,20 @@ internal sealed class SecondaryIndexManager : ISecondaryIndexManager, IDisposabl
         foreach (var (key, state) in removed)
             state.Dispose(GetIndexDirectory(key.Table, key.Field));
 
-        var dir = Path.Combine(_basePath, "indexes", table);
+        var dir = Path.Combine(_basePath, table);
         try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
         catch { /* best effort */ }
     }
-
-    // ──────────────────────────────────────────────
-    //  Startup + crash recovery
-    // ──────────────────────────────────────────────
 
     /// <summary>
     /// Loads all previously persisted indexes from disk on startup.
     /// Recovers any incomplete compaction via manifest files.
     /// </summary>
-    internal void LoadExisting()
+    public void LoadExisting()
     {
-        var indexRoot = Path.Combine(_basePath, "indexes");
-        if (!Directory.Exists(indexRoot)) return;
+        if (!Directory.Exists(_basePath)) return;
 
-        foreach (var tableDir in Directory.GetDirectories(indexRoot))
+        foreach (var tableDir in Directory.GetDirectories(_basePath))
         {
             string table = Path.GetFileName(tableDir);
             foreach (var fieldDir in Directory.GetDirectories(tableDir))
@@ -326,7 +370,7 @@ internal sealed class SecondaryIndexManager : ISecondaryIndexManager, IDisposabl
         string mergedPath = Path.Combine(dir, $"{DateTime.UtcNow.Ticks:D20}_merged.sst");
 
         // Step 2: write manifest with old file names (crash → rollback: delete merged if exists)
-        WriteManifest(manifestPath, oldTables.Select(s => s.FilePath).ToList(), mergedPath);
+        WriteManifest(manifestPath, [.. oldTables.Select(s => s.FilePath)], mergedPath);
 
         // Step 3: streaming K-way merge → merged SSTable
         SSTable mergedSst;
@@ -350,9 +394,12 @@ internal sealed class SecondaryIndexManager : ISecondaryIndexManager, IDisposabl
         state.Lock.EnterWriteLock();
         try
         {
-            toDelete = state.SSTables.Where(s => oldTables.Contains(s)).ToList();
+            // FIX: Use HashSet for O(1) lookup instead of O(K²) List.Contains
+            var oldTablesSet = new HashSet<SSTable>(oldTables);
+            toDelete = [.. state.SSTables.Where(s => oldTablesSet.Contains(s))];
+            
             // Replace: remove all old, insert merged at position 0
-            state.SSTables.RemoveAll(s => toDelete.Contains(s));
+            state.SSTables.RemoveAll(s => oldTablesSet.Contains(s));
             state.SSTables.Insert(0, mergedSst);
         }
         finally { state.Lock.ExitWriteLock(); }
@@ -478,14 +525,17 @@ internal sealed class SecondaryIndexManager : ISecondaryIndexManager, IDisposabl
         var oldFiles = new List<string>();
         string? newFile = null;
         bool mergeComplete = false;
+        bool fullyComplete = false;  // FIX: Track COMPLETE separately
 
         foreach (var line in lines)
         {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
             if (line == ManifestCompleteMarker)
             {
-                // Fully complete — just delete manifest
-                TryDeleteFile(manifestPath);
-                return;
+                fullyComplete = true;
+                continue;  // FIX: Don't early return, parse rest of manifest
             }
             if (line == "MERGED")
             {
@@ -496,6 +546,13 @@ internal sealed class SecondaryIndexManager : ISecondaryIndexManager, IDisposabl
                 oldFiles.Add(line[4..]);
             else if (line.StartsWith("NEW:"))
                 newFile = line[4..];
+        }
+
+        // FIX: If fully complete, just clean up manifest and return
+        if (fullyComplete)
+        {
+            TryDeleteFile(manifestPath);
+            return;
         }
 
         if (!mergeComplete)
@@ -534,37 +591,34 @@ internal sealed class SecondaryIndexManager : ISecondaryIndexManager, IDisposabl
         fs.Flush(flushToDisk: true);
     }
 
-    private static void TryDeleteFile(string path)
+    private static void TryDeleteFile(string sstPath)
     {
-        try { if (File.Exists(path)) File.Delete(path); }
+        try { if (File.Exists(sstPath)) File.Delete(sstPath); }
+        catch { /* best effort */ }
+        
+        // FIX: Also delete Bloom filter sidecar to prevent orphaned .bloom files
+        try
+        {
+            string bloomPath = Path.ChangeExtension(sstPath, ".bloom");
+            if (File.Exists(bloomPath))
+                File.Delete(bloomPath);
+        }
         catch { /* best effort */ }
     }
 
     private string GetIndexDirectory(string table, string field)
-        => Path.Combine(_basePath, "indexes", table, field);
+        => Path.Combine(_basePath, table, field);
 
     // ──────────────────────────────────────────────
     //  Per-index state
     // ──────────────────────────────────────────────
 
-    private sealed class FieldIndexState
+    private sealed class FieldIndexState(IndexDefinition definition, List<SSTable>? ssTables = null)
     {
-        public IndexDefinition Definition { get; }
-        public MemTable MemTable { get; }
-        public List<SSTable> SSTables { get; }
+        public IndexDefinition Definition { get; } = definition;
+        public MemTable MemTable { get; } = new();
+        public List<SSTable> SSTables { get; } = ssTables ?? [];
         public ReaderWriterLockSlim Lock { get; } = new(LockRecursionPolicy.NoRecursion);
-
-        public FieldIndexState(IndexDefinition definition)
-            : this(definition, [])
-        {
-        }
-
-        public FieldIndexState(IndexDefinition definition, List<SSTable> ssTables)
-        {
-            Definition = definition;
-            MemTable = new MemTable();
-            SSTables = ssTables;
-        }
 
         public void Dispose(string indexDirectory)
         {

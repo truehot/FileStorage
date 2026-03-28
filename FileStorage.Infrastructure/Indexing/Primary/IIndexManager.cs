@@ -29,6 +29,17 @@ internal interface IIndexManager
     /// </summary>
     void ApplySave(string table, Guid key, byte[] data, long dataOffset, long indexOffset);
 
+    /// <summary>
+    /// Writes data and index entry to disk regions and advances write cursors,
+    /// but does not publish to MemoryIndex.
+    /// </summary>
+    void ApplySavePhysical(string table, Guid key, byte[] data, long dataOffset, long indexOffset);
+
+    /// <summary>
+    /// Publishes an already persisted index entry into MemoryIndex.
+    /// </summary>
+    void PublishSave(string table, Guid key, long indexOffset);
+
     /// <summary>Marks an index entry as soft-deleted and removes it from the in-memory index.</summary>
     void ApplyDelete(string table, Guid key, long indexOffset);
 

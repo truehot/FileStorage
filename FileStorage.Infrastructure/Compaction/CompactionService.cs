@@ -1,6 +1,6 @@
-﻿using FileStorage.Infrastructure.Indexing.Primary;
-using FileStorage.Infrastructure.IO;
-using FileStorage.Infrastructure.Serialization;
+﻿using FileStorage.Infrastructure.Core.IO;
+using FileStorage.Infrastructure.Indexing.Primary;
+using FileStorage.Infrastructure.Core.Serialization;
 using System.Buffers;
 
 namespace FileStorage.Infrastructure.Compaction;
@@ -15,6 +15,8 @@ namespace FileStorage.Infrastructure.Compaction;
 internal sealed class CompactionService : ICompactionService
 {
     private const int HeaderSize = 4096;
+
+    private readonly record struct LatestEntryState(long IndexOffset, bool IsDeleted);
 
     public long Compact(
         IMmapRegion indexRegion,
@@ -31,10 +33,12 @@ internal sealed class CompactionService : ICompactionService
         string idxTmpPath = indexRegion.Path + ".tmp";
         string datTmpPath = dataRegion.Path + ".tmp";
 
+        var latestInScope = BuildLatestEntryState(indexRegion, tables);
+
         long liveCount;
         try
         {
-            liveCount = StreamToTempFiles(idxTmpPath, datTmpPath, indexRegion, dataRegion, tables);
+            liveCount = StreamToTempFiles(idxTmpPath, datTmpPath, indexRegion, dataRegion, tables, latestInScope);
         }
         catch
         {
@@ -90,12 +94,47 @@ internal sealed class CompactionService : ICompactionService
         return deadCount;
     }
 
+    private static Dictionary<(string Table, Guid Key), LatestEntryState> BuildLatestEntryState(
+        IMmapRegion indexRegion,
+        IReadOnlySet<string>? tables)
+    {
+        var latest = new Dictionary<(string Table, Guid Key), LatestEntryState>();
+        long scanPos = HeaderSize;
+
+        var buf = ArrayPool<byte>.Shared.Rent(IndexEntrySerializer.EntryFixedSize);
+        try
+        {
+            while (scanPos + IndexEntrySerializer.EntryFixedSize <= indexRegion.FileSize)
+            {
+                indexRegion.Read(scanPos, buf, 0, IndexEntrySerializer.EntryFixedSize);
+                var span = buf.AsSpan(0, IndexEntrySerializer.EntryFixedSize);
+
+                if (IndexEntrySerializer.IsEmpty(span)) break;
+
+                string table = IndexEntrySerializer.ReadTableName(span);
+                bool inScope = tables is null || tables.Contains(table);
+                if (inScope)
+                {
+                    Guid key = IndexEntrySerializer.ReadKey(span);
+                    bool isDeleted = IndexEntrySerializer.IsDeleted(span);
+                    latest[(table, key)] = new LatestEntryState(scanPos, isDeleted);
+                }
+
+                scanPos += IndexEntrySerializer.EntryFixedSize;
+            }
+        }
+        finally { ArrayPool<byte>.Shared.Return(buf, clearArray: true); }
+
+        return latest;
+    }
+
     private static long StreamToTempFiles(
         string idxTmpPath,
         string datTmpPath,
         IMmapRegion sourceIndexRegion,
         IMmapRegion sourceDataRegion,
-        IReadOnlySet<string>? tables)
+        IReadOnlySet<string>? tables,
+        IReadOnlyDictionary<(string Table, Guid Key), LatestEntryState> latestInScope)
     {
         using var datStream = new FileStream(datTmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
         using var idxStream = new FileStream(idxTmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
@@ -124,14 +163,21 @@ internal sealed class CompactionService : ICompactionService
                 bool isDeleted = IndexEntrySerializer.IsDeleted(span);
                 string table = IndexEntrySerializer.ReadTableName(span);
                 bool inScope = tables is null || tables.Contains(table);
+                Guid key = IndexEntrySerializer.ReadKey(span);
 
-                if (isDeleted && inScope)
+                if (inScope)
                 {
-                    scanPos += IndexEntrySerializer.EntryFixedSize;
-                    continue;
+                    if (!latestInScope.TryGetValue((table, key), out var latest) ||
+                        latest.IndexOffset != scanPos ||
+                        latest.IsDeleted)
+                    {
+                        scanPos += IndexEntrySerializer.EntryFixedSize;
+                        continue;
+                    }
+
+                    isDeleted = false;
                 }
 
-                Guid key = IndexEntrySerializer.ReadKey(span);
                 long oldDataOffset = IndexEntrySerializer.ReadDataOffset(span);
                 int dataSize = IndexEntrySerializer.ReadDataSize(span);
                 long version = IndexEntrySerializer.ReadVersion(span);

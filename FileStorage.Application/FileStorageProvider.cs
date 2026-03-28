@@ -1,6 +1,11 @@
 using FileStorage.Abstractions;
+using FileStorage.Application.Internal;
+using FileStorage.Application.Internal.Filtering;
 using FileStorage.Application.Validator;
 using FileStorage.Infrastructure;
+using FileStorage.Infrastructure.Core.Configuration;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace FileStorage.Application;
 
@@ -18,17 +23,61 @@ namespace FileStorage.Application;
 
 public class FileStorageProvider : IFileStorageProvider, IAsyncDisposable, IDisposable
 {
-    private readonly string _filePath;
+    private enum ProviderState
+    {
+        Active = 0,
+        Disposing = 1,
+        Disposed = 2
+    }
+
+    // Intentionally not disposed:
+    // disposing SemaphoreSlim here can race with in-flight callers that already passed
+    // state check and are waiting in Wait/WaitAsync, causing ObjectDisposedException.
+    // Provider shutdown relies on state gate + DB disposal; SemaphoreSlim is kept alive
+    // until process cleanup for safety under concurrent teardown.
     private readonly SemaphoreSlim _semaphore = new(1, 1);
+
+    private readonly StorageEngineOptions _storageOptions;
+    private readonly ILogger<FileStorageProvider> _logger;
     private IDatabase? _db;
-    private bool _isDisposed;
-    private bool _isInitialized;
+    private int _state = (int)ProviderState.Active;
 
     public FileStorageProvider(string filePath)
+        : this(filePath, NullLogger<FileStorageProvider>.Instance)
+    {
+    }
+
+    public FileStorageProvider(string filePath, ILogger<FileStorageProvider> logger)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         PathValidator.Validate(filePath);
-        _filePath = filePath;
+        ArgumentNullException.ThrowIfNull(logger);
+
+        _logger = logger;
+        _storageOptions = new StorageEngineOptions
+        {
+            FilePath = filePath
+        };
+
+        _storageOptions.Validate();
+    }
+
+    /// <summary>
+    /// Creates a provider with custom FileStorageProviderOptions.
+    /// Useful for tests and advanced scenarios.
+    /// </summary>
+    public FileStorageProvider(FileStorageProviderOptions options)
+        : this(options, NullLogger<FileStorageProvider>.Instance)
+    {
+    }
+
+    public FileStorageProvider(FileStorageProviderOptions options, ILogger<FileStorageProvider> logger)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(logger);
+
+        _logger = logger;
+        _storageOptions = options.ToStorageEngineOptions();
     }
 
     /// <summary>
@@ -39,12 +88,12 @@ public class FileStorageProvider : IFileStorageProvider, IAsyncDisposable, IDisp
     /// <exception cref="ObjectDisposedException">Thrown if the provider has been disposed.</exception>
     public async Task<IDatabase> GetAsync(CancellationToken cancellationToken = default)
     {
-        // CA1513 Fix: Use ThrowIf instead of manual if-check
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _isDisposed), typeof(FileStorageProvider));
+        ObjectDisposedException.ThrowIf(
+            Volatile.Read(ref _state) != (int)ProviderState.Active,
+            typeof(FileStorageProvider));
 
-        // Fast-path for already initialized instance
         var instance = Volatile.Read(ref _db);
-        if (Volatile.Read(ref _isInitialized) && instance != null)
+        if (instance != null)
         {
             return instance;
         }
@@ -52,30 +101,26 @@ public class FileStorageProvider : IFileStorageProvider, IAsyncDisposable, IDisp
         await _semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            // CA1513 Fix: Double-check after acquiring the lock
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _isDisposed), typeof(FileStorageProvider));
+            ObjectDisposedException.ThrowIf(
+                Volatile.Read(ref _state) != (int)ProviderState.Active,
+                typeof(FileStorageProvider));
 
-            if (!Volatile.Read(ref _isInitialized))
+            instance = Volatile.Read(ref _db);
+            if (instance == null)
             {
-                // Create the storage engine and database
                 var engine = await StorageEngineFactory
-                    .CreateAsync(_filePath)
+                    .CreateAsync(_storageOptions, _logger)
                     .ConfigureAwait(false);
 
-                var database = new Database(engine, ownsEngine: true);
+                var recordContentFilter = new Utf8RecordContentFilter(_storageOptions.FilterComparisonMode);
+                var tableFactory = new TableFactory(recordContentFilter);
+                var database = new Database(engine, tableFactory, ownsEngine: true);
 
-                // Write order matters: first the instance, then the flag
                 Volatile.Write(ref _db, database);
-                Volatile.Write(ref _isInitialized, true);
-
                 instance = database;
             }
-            else
-            {
-                instance = Volatile.Read(ref _db);
-            }
 
-            return instance ?? throw new InvalidOperationException("Database initialization failed");
+            return instance;
         }
         finally
         {
@@ -89,59 +134,114 @@ public class FileStorageProvider : IFileStorageProvider, IAsyncDisposable, IDisp
     /// <returns>A task that represents the asynchronous dispose operation.</returns>
     public async ValueTask DisposeAsync()
     {
-        // 1. Fast-path check without locking
-        if (Volatile.Read(ref _isDisposed))
+        if (Interlocked.CompareExchange(
+                ref _state,
+                (int)ProviderState.Disposing,
+                (int)ProviderState.Active) != (int)ProviderState.Active)
+        {
             return;
+        }
 
         await _semaphore.WaitAsync().ConfigureAwait(false);
         try
         {
-            // 2. Double-check under lock
-            if (Volatile.Read(ref _isDisposed))
-                return;
+            var database = Interlocked.Exchange(ref _db, null);
+            if (database is IAsyncDisposable asyncDisposable)
+            {
+                await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                database?.Dispose();
+            }
 
-            // Call the internal cleanup method (extensibility point for derived classes)
-            await DisposeAsyncCore().ConfigureAwait(false);
-
-            // Mark as fully disposed
-            Volatile.Write(ref _isDisposed, true);
+            CleanupFilesOnDisposeIfNeeded();
         }
         finally
         {
+            Volatile.Write(ref _state, (int)ProviderState.Disposed);
             _semaphore.Release();
-        }
 
-        // 3. Notify GC that the finalizer does not need to run
-        GC.SuppressFinalize(this);
-    }
-
-    /// <summary>
-    /// Core logic for disposing resources. Can be overridden by derived classes.
-    /// </summary>
-    /// <returns>A task that represents the core dispose operation.</returns>
-    protected virtual async ValueTask DisposeAsyncCore()
-    {
-        Volatile.Write(ref _isInitialized, false);
-
-        var database = Volatile.Read(ref _db);
-        if (database != null)
-        {
-            await database.DisposeAsync().ConfigureAwait(false);
-            Volatile.Write(ref _db, null);
+            // Note: _semaphore is intentionally not disposed (see field comment above).
+            GC.SuppressFinalize(this);
         }
     }
 
     /// <summary>
     /// Synchronous dispose to support standard IDisposable.
-    /// Note: This does not block on asynchronous cleanup but ensures GC suppression.
     /// </summary>
     public void Dispose()
     {
-        // We cannot safely call asynchronous DisposeAsyncCore here without risking a deadlock.
-        // However, we mark the object as disposed and suppress finalization.
-        if (Volatile.Read(ref _isDisposed)) return;
+        if (Interlocked.CompareExchange(
+                ref _state,
+                (int)ProviderState.Disposing,
+                (int)ProviderState.Active) != (int)ProviderState.Active)
+        {
+            return;
+        }
 
-        Volatile.Write(ref _isDisposed, true);
-        GC.SuppressFinalize(this);
+        _semaphore.Wait();
+        try
+        {
+            var database = Interlocked.Exchange(ref _db, null);
+            database?.Dispose();
+
+            CleanupFilesOnDisposeIfNeeded();
+        }
+        finally
+        {
+            Volatile.Write(ref _state, (int)ProviderState.Disposed);
+            _semaphore.Release();
+
+            // Note: _semaphore is intentionally not disposed (see field comment above).
+            GC.SuppressFinalize(this);
+        }
+    }
+
+    private void CleanupFilesOnDisposeIfNeeded()
+    {
+        if (!_storageOptions.DeleteFilesOnDispose)
+        {
+            return;
+        }
+
+        CleanupDatabaseFiles(_storageOptions.FilePath);
+    }
+
+    private void CleanupDatabaseFiles(string filePath)
+    {
+        var extensions = new[] { ".idx", ".dat", ".wal", ".bloom" };
+
+        foreach (var ext in extensions)
+        {
+            var file = filePath + ext;
+            try
+            {
+                if (File.Exists(file))
+                    File.Delete(file);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to delete database file '{FilePath}' during cleanup.", file);
+            }
+        }
+
+        var indexDir = GetSecondaryIndexRootPath(filePath);
+        try
+        {
+            if (Directory.Exists(indexDir))
+                Directory.Delete(indexDir, recursive: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete secondary index directory '{DirectoryPath}' during cleanup.", indexDir);
+        }
+    }
+
+    private static string GetSecondaryIndexRootPath(string filePath)
+    {
+        string basePath = Path.GetDirectoryName(filePath) ?? ".";
+        string databaseName = Path.GetFileName(filePath);
+        return Path.Combine(basePath, "indexes", databaseName);
     }
 }

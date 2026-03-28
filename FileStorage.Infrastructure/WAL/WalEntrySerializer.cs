@@ -1,6 +1,6 @@
 using System.Buffers.Binary;
 using System.Text;
-using FileStorage.Infrastructure.Hashing;
+using FileStorage.Infrastructure.Core.Hashing;
 
 namespace FileStorage.Infrastructure.WAL;
 
@@ -118,6 +118,18 @@ internal static class WalEntrySerializer
         return Crc32.Compute(payload) == storedCrc;
     }
 
+    /// <summary>
+    /// Verifies CRC32 over multiple payload segments without concatenation.
+    /// </summary>
+    public static bool VerifyCrc(
+        ReadOnlySpan<byte> part1,
+        ReadOnlySpan<byte> part2,
+        ReadOnlySpan<byte> part3,
+        ReadOnlySpan<byte> part4,
+        uint storedCrc)
+    {
+        return Crc32.Compute(part1, part2, part3, part4) == storedCrc;
+    }
     /// <summary>
     /// Size of variable part after the fixed header: tableLen + Guid + DataLen field.
     /// </summary>

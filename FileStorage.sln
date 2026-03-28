@@ -25,8 +25,12 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FileStorage.Application.Tes
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{8EC462FD-D22E-90A8-E5CE-7E832BA40C5D}"
 	ProjectSection(SolutionItems) = preProject
+		docs\architecture.md = docs\architecture.md
+		CONTRIBUTING.md = CONTRIBUTING.md
 		README.md = README.md
 	EndProjectSection
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FileStorage.Extensions.DependencyInjection.Tests", "FileStorage.Extensions.DependencyInjection.Tests\FileStorage.Extensions.DependencyInjection.Tests.csproj", "{E5379B01-7AD8-4AA1-948B-5E3D7C71E5B8}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -66,6 +70,10 @@ Global
 		{B5C8283C-B483-44C0-A68E-11E8184B97EC}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{B5C8283C-B483-44C0-A68E-11E8184B97EC}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{B5C8283C-B483-44C0-A68E-11E8184B97EC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E5379B01-7AD8-4AA1-948B-5E3D7C71E5B8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E5379B01-7AD8-4AA1-948B-5E3D7C71E5B8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E5379B01-7AD8-4AA1-948B-5E3D7C71E5B8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E5379B01-7AD8-4AA1-948B-5E3D7C71E5B8}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -75,6 +83,7 @@ Global
 		{B4D8C323-91B2-4D50-9343-E0E787C275A5} = {35F8E100-7F98-4C23-8848-4319B894BBE2}
 		{4137D6D4-322F-4E1F-BB82-DB1C7F171847} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 		{B5C8283C-B483-44C0-A68E-11E8184B97EC} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
+		{E5379B01-7AD8-4AA1-948B-5E3D7C71E5B8} = {02EA681E-C7D8-13C7-8484-4AC65E1B71E8}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {1BBF5925-F953-449E-B6B2-A5AD7883C04E}

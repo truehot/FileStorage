@@ -1,448 +1,372 @@
 ﻿using FileStorage.Abstractions;
 using FileStorage.Abstractions.SecondaryIndex;
 using FileStorage.Infrastructure.Checkpoint;
-using FileStorage.Infrastructure.Compaction;
-using FileStorage.Infrastructure.Concurrency;
-using FileStorage.Infrastructure.Indexing;
-using FileStorage.Infrastructure.Indexing.Primary;
+using FileStorage.Infrastructure.Core.Concurrency;
+using FileStorage.Infrastructure.Core.IO;
+using FileStorage.Infrastructure.Core.Lifecycle;
+using FileStorage.Infrastructure.Core.Models;
+using FileStorage.Infrastructure.Core.Operations;
 using FileStorage.Infrastructure.Indexing.SecondaryIndex;
-using FileStorage.Infrastructure.IO;
-using FileStorage.Infrastructure.Recovery;
-using FileStorage.Infrastructure.Serialization;
 using FileStorage.Infrastructure.WAL;
-using System.Buffers;
-using System.Threading;
+using System.Runtime.CompilerServices;
 
 namespace FileStorage.Infrastructure;
 
 /// <summary>
-/// Storage engine facade. Coordinates locking and delegates to
-/// <see cref="IIndexManager"/> (writes), <see cref="IRecordReader"/> (reads),
-/// <see cref="ICompactionService"/> (maintenance), and
-/// <see cref="ISecondaryIndexManager"/> (secondary indexes).
-/// Contains no serialization, position tracking, or business logic.
+/// Storage engine facade. Coordinates locking, lifetime, and delegated operation services.
 /// </summary>
 internal sealed class StorageEngine : IStorageEngine, IDisposable
 {
-    private readonly RegionProvider _regions;
+    private readonly IRegionProvider _regions;
     private readonly IWriteAheadLog _wal;
-    private readonly IMemoryIndex _memoryIndex;
-    private readonly IIndexManager _indexManager;
-    private readonly IRecordReader _recordReader;
-    private readonly IStorageRecovery _recovery;
-    private readonly ICompactionService _compaction;
     private readonly ISecondaryIndexManager _secondaryIndex;
+    private readonly CheckpointHandle _checkpointHandle;
+    private readonly StorageEngineLifetime _lifetime;
+    private readonly StorageStartupOperations _startupOperations;
+    private readonly StorageReadOperations _readOperations;
+    private readonly StorageWriteOperations _writeOperations;
+    private readonly StorageIndexOperations _indexOperations;
+    private readonly StorageMaintenanceOperations _maintenanceOperations;
     private readonly AsyncReaderWriterLock _lock = new();
     private readonly FileLock? _fileLock;
 
-    /// <summary>
-    /// Degree of parallelism for bulk reads on NVMe storage.
-    /// </summary>
-    private const int ReadParallelism = 4;
-
-    private ICheckpointManager _checkpoint;
-    private bool _disposed;
-
     internal StorageEngine(
-        RegionProvider regions,
+        IRegionProvider regions,
         IWriteAheadLog wal,
-        IMemoryIndex? memoryIndex = null,
-        IIndexManager? indexManager = null,
-        IRecordReader? recordReader = null,
-        ICheckpointManager? checkpoint = null,
-        IStorageRecovery? recovery = null,
-        ICompactionService? compaction = null,
-        ISecondaryIndexManager? secondaryIndex = null,
+        ISecondaryIndexManager secondaryIndex,
+        CheckpointHandle checkpointHandle,
+        StorageEngineLifetime lifetime,
+        StorageStartupOperations startupOperations,
+        StorageReadOperations readOperations,
+        StorageWriteOperations writeOperations,
+        StorageIndexOperations indexOperations,
+        StorageMaintenanceOperations maintenanceOperations,
         FileLock? fileLock = null)
     {
+        ArgumentNullException.ThrowIfNull(regions);
+        ArgumentNullException.ThrowIfNull(wal);
+        ArgumentNullException.ThrowIfNull(secondaryIndex);
+        ArgumentNullException.ThrowIfNull(checkpointHandle);
+        ArgumentNullException.ThrowIfNull(lifetime);
+        ArgumentNullException.ThrowIfNull(startupOperations);
+        ArgumentNullException.ThrowIfNull(readOperations);
+        ArgumentNullException.ThrowIfNull(writeOperations);
+        ArgumentNullException.ThrowIfNull(indexOperations);
+        ArgumentNullException.ThrowIfNull(maintenanceOperations);
+
         _regions = regions;
         _wal = wal;
-        _memoryIndex = memoryIndex ?? new MemoryIndex();
-        _indexManager = indexManager ?? new IndexManager(regions, _memoryIndex);
-        _recordReader = recordReader ?? new RecordReader();
-        _checkpoint = checkpoint ?? new CheckpointManager(regions.IndexRegion, regions.DataRegion, wal);
-        _recovery = recovery ?? new StorageRecovery();
-        _compaction = compaction ?? new CompactionService();
-        _secondaryIndex = secondaryIndex ?? new SecondaryIndexManager(
-            Path.GetDirectoryName(regions.IndexRegion.Path) ?? ".");
+        _secondaryIndex = secondaryIndex;
+        _checkpointHandle = checkpointHandle;
+        _lifetime = lifetime;
+        _startupOperations = startupOperations;
+        _readOperations = readOperations;
+        _writeOperations = writeOperations;
+        _indexOperations = indexOperations;
+        _maintenanceOperations = maintenanceOperations;
         _fileLock = fileLock;
     }
 
-    // ──────────────────────────────────────────────
-    //  Write operations (exclusive lock)
-    // ──────────────────────────────────────────────
-
+    /// <summary>
+    /// Initializes regions, replays WAL, and restores secondary index state.
+    /// </summary>
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        var result = _recovery.Initialize(
-            _regions.IndexRegion, _regions.DataRegion, _wal, _memoryIndex, _indexManager);
-        _indexManager.SetWritePositions(result.IndexWritePos, result.DataWritePos);
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        if (_secondaryIndex is SecondaryIndexManager sim)
-            sim.LoadExisting();
-
-        // Replay secondary index entries from WAL
-        ReplaySecondaryIndexes();
-    }
-
-    public async Task SaveAsync(string table, Guid key, byte[] data, CancellationToken cancellationToken = default)
-    {
-        await SaveAsync(table, key, data, new Dictionary<string, string>(), cancellationToken);
+        _startupOperations.Initialize();
     }
 
     /// <summary>
-    /// Saves data with indexed field values.
-    /// Both primary index and secondary indexes are updated atomically:
-    /// indexed fields are persisted in the WAL entry, so they survive crash recovery.
+    /// Saves one raw payload by primary key.
+    /// </summary>
+    public async Task SaveAsync(string table, Guid key, byte[] data, CancellationToken cancellationToken = default)
+    {
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        await _writeOperations.SaveAsync(table, key, data).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Saves data with indexed field values for secondary indexes.
     /// </summary>
     public async Task SaveAsync(string table, Guid key, byte[] data, IReadOnlyDictionary<string, string> indexedFields, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(table)) throw new ArgumentException("Table name required", nameof(table));
-        ArgumentNullException.ThrowIfNull(data);
-        if (data.Length == 0) throw new ArgumentException("Data cannot be empty", nameof(data));
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        _indexManager.ValidateTableName(table);
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
-
-        var (dataOffset, indexOffset) = _indexManager.ApplySave(table, key, data);
-
-        // WAL entry includes indexed fields — if we crash after WAL.Append but before
-        // _secondaryIndex.Put, the fields are replayed from WAL during recovery.
-        _wal.Append(new WalEntry
-        {
-            Operation = WalOperationType.Save,
-            Table = table, Key = key, Data = data,
-            DataOffset = dataOffset, IndexOffset = indexOffset,
-            IndexedFields = indexedFields
-        });
-
-        if (indexedFields.Count > 0)
-            _secondaryIndex.Put(table, key, indexedFields);
-
-        _checkpoint.TrackWrite();
+        await _writeOperations.SaveAsync(table, key, data, indexedFields).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Deletes a record and removes it from all secondary indexes.
-    /// Uses <see cref="ISecondaryIndexManager.RemoveByKey"/> since the previously
-    /// indexed values are not known at delete time.
+    /// Saves a pre-serialized batch of records for one table.
+    /// </summary>
+    public async Task SaveBatchAsync(string table, IReadOnlyCollection<StorageWriteEntry> entries, CancellationToken cancellationToken = default)
+    {
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        await _writeOperations.SaveBatchAsync(table, entries).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Deletes one record by primary key.
     /// </summary>
     public async Task DeleteAsync(string table, Guid key, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        if (!_memoryIndex.TryGet(table, key, out long indexOffset)) return;
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        _wal.Append(new WalEntry
-        {
-            Operation = WalOperationType.Delete,
-            Table = table, Key = key, Data = [],
-            DataOffset = 0, IndexOffset = indexOffset,
-            IndexedFields = new Dictionary<string, string>()
-        });
-
-        _indexManager.ApplyDelete(table, key, indexOffset);
-        _secondaryIndex.RemoveByKey(table, key);
-        _checkpoint.TrackWrite();
+        await _writeOperations.DeleteAsync(table, key).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Drops an entire table with a single WAL record.
-    /// Physical cleanup of index entries happens immediately in-memory;
-    /// disk space is reclaimed by <see cref="CompactAsync"/>.
+    /// Drops all records from the specified table.
     /// </summary>
     public async Task<long> DropTableAsync(string table, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(table))
-            throw new ArgumentException("Table name required", nameof(table));
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        long count = _memoryIndex.CountByTable(table);
-        if (count == 0) return 0;
-
-        // Single WAL record for the entire table drop — O(1) disk IO.
-        _wal.Append(new WalEntry
-        {
-            Operation = WalOperationType.DropTable,
-            Table = table, Key = Guid.Empty, Data = [],
-            DataOffset = 0, IndexOffset = 0,
-            IndexedFields = new Dictionary<string, string>()
-        });
-
-        _indexManager.ApplyDropTable(table);
-        _secondaryIndex.DropAllIndexes(table);
-        _checkpoint.TrackWrite();
-
-        return count;
+        return await _writeOperations.DropTableAsync(table).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Removes all records from a table. The table remains queryable (returns empty).
-    /// A single WAL record marks all data as invalid for crash recovery.
-    /// Disk space is reclaimed by <see cref="CompactAsync"/>.
+    /// Removes all records from a table but the table continues to exist.
     /// </summary>
     public async Task<long> TruncateTableAsync(string table, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(table))
-            throw new ArgumentException("Table name required", nameof(table));
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        long count = _memoryIndex.CountByTable(table);
-        if (count == 0) return 0;
-
-        _wal.Append(new WalEntry
-        {
-            Operation = WalOperationType.TruncateTable,
-            Table = table, Key = Guid.Empty, Data = [],
-            DataOffset = 0, IndexOffset = 0,
-            IndexedFields = new Dictionary<string, string>()
-        });
-
-        _indexManager.ApplyTruncateTable(table);
-        _secondaryIndex.DropAllIndexes(table);
-        _checkpoint.TrackWrite();
-
-        return count;
+        return await _writeOperations.TruncateTableAsync(table).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Rewrites storage files to reclaim space for selected tables or for all tables when the input array is empty.
+    /// </summary>
     public async Task<long> CompactAsync(string[] tables, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        _checkpoint.ForceCheckpoint();
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        IReadOnlySet<string>? scope = tables.Length > 0
-            ? new HashSet<string>(tables, StringComparer.Ordinal)
-            : null;
-
-        long removed = _compaction.Compact(
-            _regions.IndexRegion, _regions.DataRegion, _memoryIndex,
-            reopenRegion: _regions.Reopen,
-            scope);
-
-        _indexManager.RecalculateWritePositions();
-
-        _checkpoint = new CheckpointManager(_regions.IndexRegion, _regions.DataRegion, _wal);
-
-        return removed;
+        return await _maintenanceOperations.CompactAsync(tables).ConfigureAwait(false);
     }
 
-    // ──────────────────────────────────────────────
-    //  Secondary index operations
-    // ──────────────────────────────────────────────
+    /// <summary>
+    /// Drops a secondary index for the specified table field.
+    /// </summary>
     public async Task DropIndexAsync(string table, string fieldName, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
-        _secondaryIndex.DropIndex(table, fieldName);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        await _indexOperations.DropIndexAsync(table, fieldName).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Returns active secondary indexes for the specified table.
+    /// </summary>
     public async Task<IReadOnlyList<IndexDefinition>> GetIndexesAsync(string table, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
-        return _secondaryIndex.GetIndexes(table);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        return await _indexOperations.GetIndexesAsync(table).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Looks up record keys using a secondary index.
+    /// </summary>
     public async Task<List<Guid>?> LookupByIndexAsync(string table, string fieldName, string value, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
-        if (!_secondaryIndex.HasIndex(table, fieldName))
-            return null;
-        return _secondaryIndex.Lookup(table, fieldName, value);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        return await _indexOperations.LookupByIndexAsync(table, fieldName, value).ConfigureAwait(false);
     }
 
-    // ──────────────────────────────────────────────
-    //  Read operations (shared lock)
-    // ──────────────────────────────────────────────
-
+    /// <summary>
+    /// Reads one record by primary key.
+    /// </summary>
     public async Task<StorageRecord?> GetByKeyAsync(string table, Guid key, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        if (!_memoryIndex.TryGet(table, key, out long indexOffset)) return null;
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        var buffer = ArrayPool<byte>.Shared.Rent(_indexManager.EntrySize);
-        try
-        {
-            return _recordReader.Read(
-                _regions.IndexRegion, _regions.DataRegion, buffer, indexOffset, table, key);
-        }
-        finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
+        return await _readOperations.GetByKeyAsync(table, key).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Returns records for a table with skip/take pagination.
-    /// Uses parallel reads when candidate count exceeds <see cref="ReadParallelism"/>
-    /// to saturate NVMe bandwidth. Each read uses its own buffer from ArrayPool.
-    /// MmapRegion.Read is thread-safe under read lock (snapshot-based accessor).
     /// </summary>
     public async Task<List<StorageRecord>> GetByTableAsync(string table, int skip = 0, int take = int.MaxValue, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        var candidates = _memoryIndex.GetByTable(table, skip, take);
-        if (candidates.Count == 0)
-            return [];
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        // Small result set — sequential is faster (no Task overhead)
-        if (candidates.Count <= ReadParallelism)
-            return ReadSequential(candidates, table);
-
-        // Large result set — parallel reads
-        return await ReadParallelAsync(candidates, table, take, cancellationToken);
+        return await _readOperations.GetByTableAsync(table, skip, take, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Streams records for a table lazily without pre-buffering a list of records.
+    /// </summary>
+    public async IAsyncEnumerable<StorageRecord> GetByTableStreamAsync(
+        string table,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        await foreach (var record in _readOperations.GetByTableStreamAsync(table, cancellationToken).ConfigureAwait(false))
+        {
+            yield return record;
+        }
+    }
+
+    /// <summary>
+    /// Returns the number of live records in the specified table.
+    /// </summary>
     public async Task<long> CountAsync(string table, CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
-        return _memoryIndex.CountByTable(table);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        return await _readOperations.CountAsync(table).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Returns names of tables that currently contain live records.
+    /// </summary>
     public async Task<IReadOnlyList<string>> ListTablesAsync(CancellationToken cancellationToken = default)
     {
-        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
-        return _memoryIndex.GetTableNames();
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        return await _readOperations.ListTablesAsync().ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Returns <c>true</c> if a table currently exists and contains live records.
+    /// </summary>
     public async Task<bool> TableExistsAsync(string table, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(table)) return false;
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        using var _ = await _lock.AcquireReadLockAsync(cancellationToken);
-        return _memoryIndex.TableExists(table);
-    }
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-    // ──────────────────────────────────────────────
-    //  Lifecycle
-    // ──────────────────────────────────────────────
-
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _disposed = true;
-
-        try { _checkpoint.ForceCheckpoint(); }
-        catch (ObjectDisposedException) { }
-
-        if (_secondaryIndex is IDisposable disposable)
-            disposable.Dispose();
-
-        _wal.Dispose();
-        _regions.Dispose();
-        _lock.Dispose();
-        _fileLock?.Dispose();
-    }
-
-    // ──────────────────────────────────────────────
-    //  Private helpers
-    // ──────────────────────────────────────────────
-
-    /// <summary>
-    /// Replays WAL entries to rebuild secondary index state that may have been
-    /// lost if a crash occurred between WAL.Append and _secondaryIndex.Put.
-    /// Only processes Save entries that have non-empty IndexedFields.
-    /// </summary>
-    private void ReplaySecondaryIndexes()
-    {
-        var entries = _wal.ReadAll();
-        foreach (var entry in entries)
-        {
-            switch (entry.Operation)
-            {
-                case WalOperationType.Save when entry.IndexedFields is { Count: > 0 }:
-                    _secondaryIndex.Put(entry.Table, entry.Key, entry.IndexedFields);
-                    break;
-
-                case WalOperationType.Delete:
-                    _secondaryIndex.RemoveByKey(entry.Table, entry.Key);
-                    break;
-
-                case WalOperationType.DropTable:
-                case WalOperationType.TruncateTable:
-                    _secondaryIndex.DropAllIndexes(entry.Table);
-                    break;
-            }
-        }
-    }
-
-    private List<StorageRecord> ReadSequential(
-        IReadOnlyList<(Guid Key, long Offset)> candidates, string table)
-    {
-        var result = new List<StorageRecord>(candidates.Count);
-        var buffer = ArrayPool<byte>.Shared.Rent(_indexManager.EntrySize);
-        try
-        {
-            foreach (var (k, indexOffset) in candidates)
-            {
-                var record = _recordReader.Read(
-                    _regions.IndexRegion, _regions.DataRegion, buffer, indexOffset, table, k);
-
-                if (record is not null)
-                    result.Add(record);
-            }
-        }
-        finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
-
-        return result;
+        return await _readOperations.TableExistsAsync(table).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Reads records in parallel batches. Each batch of <see cref="ReadParallelism"/>
-    /// records is read concurrently using Task.Run + per-task ArrayPool buffer.
-    /// 
-    /// Thread safety: <see cref="MmapRegion.Read"/> is safe under the shared read lock
-    /// because it acquires a snapshot reference — concurrent readers never see a disposed accessor.
+    /// Reads multiple records by keys under one read lock with skip/take semantics.
     /// </summary>
-    private async Task<List<StorageRecord>> ReadParallelAsync(
-        IReadOnlyList<(Guid Key, long Offset)> candidates, string table, int take, CancellationToken cancellationToken)
+    public async Task<List<StorageRecord>> GetByKeysAsync(
+        string table,
+        IReadOnlyList<Guid> keys,
+        int skip = 0,
+        int take = int.MaxValue,
+        CancellationToken cancellationToken = default)
     {
-        var result = new List<StorageRecord>(Math.Min(candidates.Count, take));
-        int entrySize = _indexManager.EntrySize;
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        // Process in chunks to limit concurrent tasks
-        for (int i = 0; i < candidates.Count && result.Count < take; i += ReadParallelism)
-        {
-            int batchSize = Math.Min(ReadParallelism, candidates.Count - i);
-            var tasks = new Task<StorageRecord?>[batchSize];
+        using var _ = await _lock.AcquireReadLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-            for (int j = 0; j < batchSize; j++)
-            {
-                var (k, indexOffset) = candidates[i + j];
-                tasks[j] = Task.Run(() =>
-                {
-                    var buf = ArrayPool<byte>.Shared.Rent(entrySize);
-                    try
-                    {
-                        return _recordReader.Read(
-                            _regions.IndexRegion, _regions.DataRegion, buf, indexOffset, table, k);
-                    }
-                    finally { ArrayPool<byte>.Shared.Return(buf, clearArray: true); }
-                }, cancellationToken);
-            }
-
-            var records = await Task.WhenAll(tasks);
-
-            foreach (var record in records)
-            {
-                if (result.Count >= take) break;
-                if (record is not null)
-                    result.Add(record);
-            }
-        }
-
-        return result;
+        return await _readOperations.GetByKeysAsync(table, keys, skip, take, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Ensures a secondary index exists for the specified table field.
+    /// </summary>
     public async Task EnsureIndexAsync(string table, string fieldName, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(fieldName))
-            throw new ArgumentException("Field name required", nameof(fieldName));
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
 
-        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken);
-        _secondaryIndex.EnsureIndex(table, fieldName);
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        await _indexOperations.EnsureIndexAsync(table, fieldName).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Flushes pending checkpoint state and releases all engine-owned resources.
+    /// </summary>
+    public void Dispose()
+    {
+        if (!_lifetime.TryBeginDispose())
+            return;
+
+        using var writeLock = _lock.AcquireWriteLock();
+        try
+        {
+            try
+            {
+                _checkpointHandle.Current.ForceCheckpoint();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+
+            if (_secondaryIndex is IDisposable disposable)
+                disposable.Dispose();
+
+            _wal.Dispose();
+            _regions.Dispose();
+        }
+        finally
+        {
+            _lifetime.MarkDisposed();
+            _fileLock?.Dispose();
+            _lock.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Deletes a batch of records by primary keys.
+    /// </summary>
+    public async Task DeleteBatchAsync(string table, IEnumerable<Guid> keys, CancellationToken cancellationToken = default)
+    {
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        using var _ = await _lock.AcquireWriteLockAsync(cancellationToken).ConfigureAwait(false);
+        _lifetime.ThrowIfNotActive(typeof(StorageEngine));
+
+        await _writeOperations.DeleteBatchAsync(table, keys).ConfigureAwait(false);
     }
 }

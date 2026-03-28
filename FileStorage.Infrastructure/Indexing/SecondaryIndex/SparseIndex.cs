@@ -5,14 +5,9 @@ namespace FileStorage.Infrastructure.Indexing.SecondaryIndex;
 /// Holds every Nth key with its block-aligned file offset, enabling binary search
 /// to locate the approximate 4 KB block, then a short linear scan within it.
 /// </summary>
-internal sealed class SparseIndex
+internal sealed class SparseIndex(List<SparseIndexEntry> entries)
 {
-    private readonly List<SparseIndexEntry> _entries;
-
-    public SparseIndex(List<SparseIndexEntry> entries)
-    {
-        _entries = entries;
-    }
+    private readonly List<SparseIndexEntry> _entries = entries;
 
     public IReadOnlyList<SparseIndexEntry> Entries => _entries;
 

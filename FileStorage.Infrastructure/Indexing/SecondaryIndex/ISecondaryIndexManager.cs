@@ -30,6 +30,11 @@ internal interface ISecondaryIndexManager
     void Put(string table, Guid recordKey, IReadOnlyDictionary<string, string> indexedFields);
 
     /// <summary>
+    /// Inserts indexed field values for multiple records.
+    /// </summary>
+    void PutRange(string table, IReadOnlyCollection<(Guid RecordKey, IReadOnlyDictionary<string, string> IndexedFields)> entries);
+
+    /// <summary>
     /// Removes a record from all secondary indexes for the table using known previous values.
     /// </summary>
     void Remove(string table, Guid recordKey, IReadOnlyDictionary<string, string> previousValues);
@@ -57,4 +62,9 @@ internal interface ISecondaryIndexManager
     /// If the index already exists, this is a no-op.
     /// </summary>
     void EnsureIndex(string table, string fieldName);
+
+    /// <summary>
+    /// Loads previously persisted secondary indexes from disk during startup.
+    /// </summary>
+    void LoadExisting();
 }

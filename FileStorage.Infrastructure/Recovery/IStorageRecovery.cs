@@ -1,5 +1,5 @@
 using FileStorage.Infrastructure.Indexing.Primary;
-using FileStorage.Infrastructure.IO;
+using FileStorage.Infrastructure.Core.IO;
 using FileStorage.Infrastructure.WAL;
 
 namespace FileStorage.Infrastructure.Recovery;

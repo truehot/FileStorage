@@ -1,5 +1,5 @@
 using FileStorage.Infrastructure.Indexing.Primary;
-using FileStorage.Infrastructure.IO;
+using FileStorage.Infrastructure.Core.IO;
 
 namespace FileStorage.Infrastructure.Compaction;
 

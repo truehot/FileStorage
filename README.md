@@ -1,95 +1,228 @@
-### 📦 FileStorage
+## 📦 FileStorage
 
 > [!CAUTION]
 > NOT FOR PRODUCTION USE > This library is under active development. API signatures, disk formats, and internal behaviors (including WAL and Indexing) are subject to breaking changes. Targeting .NET 9.
 
 FileStorage is an embedded, LSM-inspired storage engine optimized for high-throughput writes and low-latency lookups. It leverages Memory-Mapped Files (MMF) and Write-Ahead Logging (WAL) to balance extreme performance with crash resilience.
 
+
 ### 🏗 Solution Structure
 
 ```
 FileStorage.sln 
-├── FileStorage.Abstractions/   # Domain contracts & interfaces (IDatabase, ITable)
-├── FileStorage.Application/    # High-level logic, TableManager, and API Orchestration
-├── FileStorage.Infrastructure/ # Low-level engine: MmapStorage, WalJournal, LsmCompactor
-├── Samples.ConsoleApp/         # Comprehensive CLI demo: CRUD, Indexes, Compaction
-├── Samples.API/                # Minimal API integration & Dependency Injection example
-└── Tests/                      # Unit, Integration, and Crash-Resilience tests
+├── FileStorage.Abstractions/                   # Public contracts (IDatabase, ITable, StorageRecord, IFileStorageProvider)
+├── FileStorage.Application/                    # Provider entry point and application-level orchestration
+├── FileStorage.Infrastructure/                 # Storage engine internals: regions, WAL, indexing, recovery, compaction
+├── FileStorage.Extensions.DependencyInjection/ # DI registration extensions
+├── Samples.ConsoleApp/                         # Comprehensive CLI demo: CRUD, indexes, compaction
+└── Samples.API/                                # Minimal API integration and DI example
 ```
+
+
 ### ⚡ Key Features
 
-Feature	Technical      Implementation
-* Async-Native    Full IAsyncEnumerable support for non-blocking data streaming.
-* Crash-Resilience    Monotonic Sequence Numbers + WAL journal with mandatory CRC32C.
-* Fast Indexing    Persistent LSM-tree based secondary indexes for complex queries.
-* Probabilistic Lookups    Integrated Bloom Filters to prevent unnecessary disk I/O.
-* Atomic Compaction    Manifest-based "Shadow Paging" protocol for safe data merging.
-* Memory Efficiency    Zero-copy serialization using BinaryPrimitives and ArrayPool.
+| Feature                | Technical Implementation                                                               |
+|-----------------------|-----------------------------------------------------------------------------------------|
+| Async-Native          | Full IAsyncEnumerable support for non-blocking data streaming.                          |
+| Crash-Resilience      | Monotonic Sequence Numbers + WAL journal with mandatory CRC32C.                         |
+| Fast Indexing         | Persistent LSM-tree based secondary indexes for complex queries.                        |
+| Probabilistic Lookups | Integrated Bloom Filters to prevent unnecessary disk I/O.                               |
+| Atomic Compaction     | Manifest-based "Shadow Paging" protocol for safe data merging.                          |
+| Memory Efficiency     | Zero-copy serialization using BinaryPrimitives and ArrayPool.                           |
+
 
 ### 🚀 Quick Start
-```C#
 
-// Initialize the engine via Provider (Dependency Injection ready)
-await using var provider = new FileStorageProvider("Data/FileStorage.db");
-var db = await provider.GetAsync();
+#### 1. Manual Setup (Console/Library)
 
-// Tables are logical partitions within the storage root
+```csharp
+using FileStorage.Abstractions;
+using FileStorage.Application;
+using FileStorage.Application.Extensions; // Required for GetDataAsUtf8String()
+
+// 1. Initialize the engine via provider
+await using IFileStorageProvider provider = new FileStorageProvider("Data/FileStorage.db");
+IDatabase db = await provider.GetAsync();
+
+// 2. Open a table (logical partition)
 var usersTable = db.OpenTable("users");
 
-// Save data with secondary index metadata for fast filtering
+// 3. IMPORTANT: Ensure secondary indexes are initialized before use
+await usersTable.EnsureIndexAsync("status");
+
+// 4. Save data with metadata for secondary indexing
 var userId = Guid.NewGuid();
 var metadata = new Dictionary<string, string> { ["status"] = "active" };
+
+// Supports raw bytes, strings, or custom serializers
 await usersTable.SaveAsync(userId, "{\"name\":\"Alice\"}", metadata);
 
-// Efficient Filtering using Secondary Indexes & Bloom Filters
-// Streams data directly from memory-mapped regions
-var activeUsers = usersTable.StreamAsync(filterKey: "status", filterValue: "active");
+// 5. Filtering by secondary index
+var activeUsers = await usersTable.FilterAsync(filterField: "status", filterValue: "active");
 
 await foreach (var record in activeUsers)
 {
-    // record.Data is handled efficiently via internal buffer pooling
-    Console.WriteLine($"Found active user: {record.Key}");
+    // Access raw data or use UTF8 string helper
+    Console.WriteLine($"Found: {record.Key}, Data: {record.GetDataAsUtf8String()}");
 }
 ```
+
+#### 2. Dependency Injection (ASP.NET Core)
+
+```csharp
+// Registration in Program.cs
+builder.Services.AddFileStorageProvider("Data/FileStorage.db", options => {
+    options.CheckpointWriteThreshold = 1000;
+    options.FilterComparisonMode = StringComparison.OrdinalIgnoreCase;
+});
+
+// Usage in Service
+public class UserService
+{
+    private readonly IFileStorageProvider _provider;
+
+    public UserService(IFileStorageProvider provider)
+    {
+        _provider = provider;
+    }
+
+    public async Task CreateUser(User user)
+    {
+        // Get IDatabase instance asynchronously
+        var db = await _provider.GetAsync();
+        var table = db.OpenTable("users");
+
+        // Ensure index exists for the field we want to filter later
+        await table.EnsureIndexAsync("role");
+
+        // Serialize the object to string (or bytes)
+        var json = JsonSerializer.Serialize(user);
+
+        await table.SaveAsync(user.Id, json,
+            new Dictionary<string, string> { ["role"] = user.Role });
+    }
+}
+```
+
+
+### 🔍 Text Filtering & Encoding 
+
+FileStorage stores payloads as raw byte[], but table-level filtering interprets them as UTF-8 text.
+
+- Comparison Modes: Configured via FileStorageProviderOptions.FilterComparisonMode.
+
+    StringComparison.OrdinalIgnoreCase (Default) — for case-insensitive search.
+
+    StringComparison.Ordinal — for strict case-sensitive matching.
+
+- Validation: Supported values are restricted to the two above. Unsupported values throw an exception during provider creation.
+
+- Best Practice: Use UTF-8 encoded textual payloads when relying on content filtering. Use record.GetDataAsUtf8String() from FileStorage.Application.Extensions for consumption.
+
+
 ### 🧠 Architecture
 
-FileStorage is designed for high-concurrency environments where write-amplification must be minimized and read-performance must scale.
+FileStorage is designed as an embedded storage library with a layered architecture:
+
+- `FileStorage.Abstractions` exposes only the public contracts.
+- `FileStorage.Application` owns the provider and table/database orchestration.
+- `FileStorage.Infrastructure` contains the storage engine internals, including WAL, memory-mapped regions, primary index management, secondary indexes, recovery, and compaction.
+- `FileStorage.Extensions.DependencyInjection` provides DI registration helpers.
+
+Internally, the storage engine is composed from focused services for startup, reads, writes, secondary-index operations, and maintenance, while `StorageEngineFactory` and `StorageEngineComposition` assemble the required dependencies.
+
+
+### 🧪 Test Projects
+
+- `FileStorage.Extensions.DependencyInjection.Tests` — covers DI registration, invalid options, and service wiring for `ServiceCollectionExtensions`.
+- `FileStorage.Application.Tests` — covers provider, table, and batch API behavior.
+- `FileStorage.Infrastructure.Tests` — covers engine, WAL, mmap, and index internals.
+
 
 ### 📦 Storage Engine & Persistence
 
-Append-only Logging: High-performance data ingestion with background Compaction and Shadow Paging for safe, atomic file merging.
+Append-only logging provides durable write intent before physical application. Compaction rewrites storage files to reclaim space while preserving crash safety.
 
-Mmap-Powered I/O: Utilizes memory-mapped regions (MmapRegion) for zero-copy access and atomic point-in-time views for concurrent readers at the file level.
+Memory-mapped regions (`MmapRegion`) provide efficient access to index and data files and support safe region reopening during compaction.
 
-Write-Ahead Log (WAL): Ensures strict durability via FlushFileBuffers (Win32) / fsync (POSIX) to prevent data loss.
+The Write-Ahead Log (WAL) is the durability boundary and is replayed during recovery to restore consistent state after unexpected shutdowns.
+
 
 ### 🛡️ Data Integrity & Recovery
 
-Per-record CRC32C: Hardware-accelerated validation to detect "Torn Writes" or bit rot at the storage level.
+Per-record CRC32C validation detects incomplete or corrupted WAL records.
 
-Crash Resilience: Automated recovery through WAL replay and checkpointing, ensuring state consistency after unexpected shutdowns.
+Recovery is checkpoint-aware and replays WAL entries after restoring primary index state. Secondary indexes are loaded from disk and then updated from WAL-derived mutations as part of startup.
+
 
 ### ⚡ Performance & Concurrency
 
-Zero-Copy Pipeline: Deep integration of Span<T>, Memory<T>, and ArrayPool<byte> to eliminate GC pressure and redundant allocations.
+The implementation uses `Span<T>`, `Memory<T>`, and `ArrayPool<byte>` heavily to reduce allocations and keep hot paths efficient.
 
-Non-blocking I/O: Orchestrates background tasks using System.Threading.Channels and lease-based locking for thread-safe coordination.
+Concurrency is coordinated through engine-level read/write locking together with snapshot-safe region access and lifecycle gating during disposal.
 
-Lock-free Reads: Provides consistent file-level access for readers, ensuring they always see a valid state without contention with active writers.
+Streaming APIs expose records incrementally via `IAsyncEnumerable<T>` without materializing full result sets up front.
+
 
 ### 🛠 Key Components
 
-MmapRegion: Manages memory-mapped file segments with automatic growth and snapshot-based access safety.
+`FileStorageProvider`: main application entry point and lifecycle owner for the database handle.
 
-WAL (Write-Ahead Log): The "Source of Truth" for all write operations, used for reconstruction of the index state.
+`StorageEngineFactory`: creates and wires the storage engine from validated options.
 
-IndexManager: Coordinates primary and LSM-tree based secondary indexes for optimized lookups.
+`StorageEngine`: internal orchestration facade over startup, read, write, index, and maintenance operations.
 
-CompactionService: Handles background merging of fragmented data files to reclaim space via shadow paging.
+`MmapRegion`: manages memory-mapped file segments with automatic growth and safe reopening during compaction.
 
-BloomFilter: A probabilistic data structure that speeds up queries by quickly ruling out non-existent keys in secondary indexes.
+`WriteAheadLog`: append-only durability log used by checkpointing and recovery.
 
-FileStorageProvider: The main entry point for Dependency Injection and lifecycle management.
+`IndexManager` and `MemoryIndex`: coordinate persistent and in-memory primary index state.
+
+`SecondaryIndexManager`: manages LSM-style secondary indexes, including flush, lookup, and compaction behavior.
+
+`CompactionService`: rewrites fragmented data files to reclaim space safely.
+
+`BloomFilter`: probabilistic pre-check used by secondary-index SSTables.
+
+
+### 🏮 Advanced Usage Patterns
+
+#### Batch Operations
+
+Batching reduces WAL synchronization overhead and significantly increases write throughput.
+
+#### Batch Writes
+
+- Use `SaveBatchAsync<T>` to write multiple records in a single operation.
+- Provide `keySelector` and `dataSerializer` so records are converted to `byte[]` before persistence.
+- Optionally provide `indexedFieldsSelector` to update secondary indexes during batch writes.
+
+#### Batch Save Example
+
+```csharp
+var users = db.OpenTable("users");
+
+var batch = new[]
+{
+    new { Id = Guid.NewGuid(), Name = "Alice", Age = 28 },
+    new { Id = Guid.NewGuid(), Name = "Bob", Age = 31 }
+};
+
+await users.SaveBatchAsync(
+    batch,
+    keySelector: x => x.Id,
+    dataSerializer: x => JsonSerializer.SerializeToUtf8Bytes(new { x.Name, x.Age }, JsonSerializerOptions.Web),
+    indexedFieldsSelector: x => new Dictionary<string, string> { ["name"] = x.Name });
+```
+
+#### Batch Delete Example
+
+```csharp
+// Batch delete by keys (atomic, crash-safe)
+var idsToDelete = new[] { id1, id2, id3 };
+await usersTable.DeleteBatchAsync(idsToDelete);
+```
+
 
 ### ⚠️ Limitations
 
@@ -99,12 +232,14 @@ Single-Node Engine: Designed as an embedded database; not suitable for distribut
 
 Experimental API: Internal structures and disk formats are subject to change during the active development phase.
 
+
 ### 📂 Samples & Evaluation
 
 Samples.ConsoleApp: A deep dive into core engine capabilities, including manual compaction triggers and index rebuilding.
 
-Samples.Api: Demonstrates how to register FileStorage in a DI container using .AddFileStorage() and use it within controllers.
+Samples.API: Demonstrates how to register FileStorage in a DI container using `.AddFileStorageProvider()` and use it in Minimal API endpoints.
 
-### 📄 License
+
+### 📜 License
 
 Distributed under the MIT License. See LICENSE for more information.

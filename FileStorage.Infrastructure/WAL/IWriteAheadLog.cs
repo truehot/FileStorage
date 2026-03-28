@@ -8,5 +8,6 @@ internal interface IWriteAheadLog : IDisposable
     long SequenceNumber { get; }
     long Append(WalEntry entry);
     List<WalEntry> ReadAll();
+    IEnumerable<WalEntry> ReadAllStreaming();
     void Checkpoint();
 }

@@ -1,7 +1,7 @@
 using FileStorage.Abstractions;
 using FileStorage.Infrastructure;
 
-namespace FileStorage.Application;
+namespace FileStorage.Application.Internal;
 
 /// <summary>
 /// Creates <see cref="ITable"/> instances. Abstracted for testability.

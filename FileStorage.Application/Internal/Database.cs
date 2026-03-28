@@ -2,7 +2,7 @@ using FileStorage.Abstractions;
 using FileStorage.Application.Validator;
 using FileStorage.Infrastructure;
 
-namespace FileStorage.Application;
+namespace FileStorage.Application.Internal;
 
 /// <summary>
 /// Database-level handle. Owns the storage engine lifecycle.
@@ -14,10 +14,13 @@ internal sealed class Database : IDatabase
     private readonly bool _ownsEngine;
     private bool _disposed;
 
-    internal Database(IStorageEngine engine, ITableFactory? tableFactory = null, bool ownsEngine = true)
+    internal Database(IStorageEngine engine, ITableFactory tableFactory, bool ownsEngine = true)
     {
+        ArgumentNullException.ThrowIfNull(engine);
+        ArgumentNullException.ThrowIfNull(tableFactory);
+
         _engine = engine;
-        _tableFactory = tableFactory ?? new TableFactory();
+        _tableFactory = tableFactory;
         _ownsEngine = ownsEngine;
     }
 
@@ -51,7 +54,7 @@ internal sealed class Database : IDatabase
     /// <summary>
     /// Reclaims disk space by rewriting files without soft-deleted records.
     /// Pass table names to compact selectively, or omit to compact all.
-    /// Uses atomic file rename — fully crash-safe.
+    /// Uses atomic file rename - fully crash-safe.
     /// </summary>
     public async Task<long> CompactAsync(string[]? tables, CancellationToken cancellationToken = default)
     {

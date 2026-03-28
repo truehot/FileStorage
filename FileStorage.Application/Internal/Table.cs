@@ -1,65 +1,144 @@
 ﻿using FileStorage.Abstractions;
 using FileStorage.Abstractions.SecondaryIndex;
+using FileStorage.Application.Internal.Filtering;
 using FileStorage.Infrastructure;
-using System.Buffers;
+using FileStorage.Infrastructure.Core.Models;
 using System.Runtime.CompilerServices;
-using System.Text;
 
-namespace FileStorage.Application;
+namespace FileStorage.Application.Internal;
 
-/// <summary>
-/// Table-level handle. Lightweight object — does not own the engine.
-/// Content-level filtering (text search, encoding) lives here,
-/// not in the storage engine which operates on raw byte[] only.
-/// </summary>
+// Table-level handle. Lightweight object — does not own the engine.
+// Content-level filtering (text search, encoding) is implemented here,
+// not in the storage engine, which operates on raw byte[] only.
 internal sealed class Table : ITable
 {
     private readonly IStorageEngine _engine;
+    private readonly IRecordContentFilter _recordContentFilter;
 
     public string Name { get; }
 
-    internal Table(string name, IStorageEngine engine)
+    internal Table(string name, IStorageEngine engine, IRecordContentFilter recordContentFilter)
     {
         ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(engine);
+        ArgumentNullException.ThrowIfNull(recordContentFilter);
+
         Name = name;
         _engine = engine;
+        _recordContentFilter = recordContentFilter;
     }
 
-    public async Task SaveAsync(Guid key, string data, CancellationToken cancellationToken = default)
+    public async Task SaveAsync(Guid key, byte[] data, IReadOnlyDictionary<string, string>? indexedFields = null, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(data))
-            throw new ArgumentException("Data cannot be null or empty.", nameof(data));
+        ArgumentNullException.ThrowIfNull(data);
+        if (data.Length == 0)
+            throw new ArgumentException("Data cannot be empty.", nameof(data));
 
-        byte[] bytes = Encoding.UTF8.GetBytes(data);
-
-        try
+        if (indexedFields is null)
         {
-            await _engine.SaveAsync(Name, key, bytes, cancellationToken);
+            await _engine.SaveAsync(Name, key, data, cancellationToken);
         }
-        catch (InvalidOperationException ex) when (ex.Message.Contains("maximum size"))
+        else
         {
-            throw new InvalidOperationException(
-                $"Storage capacity exceeded. Unable to save record (table: '{Name}', key: {key}, data size: {bytes.Length} bytes).", ex);
+            await _engine.SaveAsync(Name, key, data, indexedFields, cancellationToken);
         }
     }
 
-    public async Task SaveAsync(Guid key, string data, IReadOnlyDictionary<string, string> indexedFields, CancellationToken cancellationToken = default)
+    public async Task SaveAsync(Guid key, string data, IReadOnlyDictionary<string, string>? indexedFields = null, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(data))
-            throw new ArgumentException("Data cannot be null or empty.", nameof(data));
-        ArgumentNullException.ThrowIfNull(indexedFields);
+        ArgumentNullException.ThrowIfNull(data);
+        if (data.Length == 0)
+            throw new ArgumentException("Data cannot be empty.", nameof(data));
+        var bytes = System.Text.Encoding.UTF8.GetBytes(data);
+        await SaveAsync(key, bytes, indexedFields, cancellationToken);
+    }
 
-        byte[] bytes = Encoding.UTF8.GetBytes(data);
+    public async Task SaveAsync<T>(Guid key, T item, Func<T, string> dataSelector, IReadOnlyDictionary<string, string>? indexedFields = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(dataSelector);
+        var data = dataSelector(item);
+        await SaveAsync(key, data, indexedFields, cancellationToken);
+    }
 
+    public async Task SaveAsync<T>(Guid key, T item, Func<T, byte[]> dataSelector, IReadOnlyDictionary<string, string>? indexedFields = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(dataSelector);
+        var data = dataSelector(item);
+        await SaveAsync(key, data, indexedFields, cancellationToken);
+    }
+
+    /// <summary>
+    /// Accepts a generic batch, validates input, serializes each item to <see cref="byte[]"/>
+    /// before entering the storage engine, and forwards a normalized batch write.
+    /// </summary>
+    public async Task SaveBatchAsync<T>(
+        IReadOnlyCollection<T> items,
+        Func<T, Guid> keySelector,
+        Func<T, string> dataSelector,
+        Func<T, IReadOnlyDictionary<string, string>>? indexedFieldsSelector = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        ArgumentNullException.ThrowIfNull(keySelector);
+        ArgumentNullException.ThrowIfNull(dataSelector);
+        if (items.Count == 0)
+            throw new ArgumentException("Batch cannot be empty.", nameof(items));
+        var entries = new List<StorageWriteEntry>(items.Count);
+        foreach (var item in items)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Guid key = keySelector(item);
+            if (key == Guid.Empty)
+                throw new ArgumentException("Batch item key cannot be empty.", nameof(items));
+            string data = dataSelector(item);
+            ArgumentNullException.ThrowIfNull(data);
+            if (data.Length == 0)
+                throw new ArgumentException("Batch item data cannot be empty.", nameof(items));
+            var indexedFields = indexedFieldsSelector?.Invoke(item) ?? new Dictionary<string, string>();
+            ArgumentNullException.ThrowIfNull(indexedFields);
+            entries.Add(new StorageWriteEntry(key, System.Text.Encoding.UTF8.GetBytes(data), indexedFields));
+        }
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
-            await _engine.SaveAsync(Name, key, bytes, indexedFields, cancellationToken);
+            await _engine.SaveBatchAsync(Name, entries, cancellationToken);
         }
-        catch (InvalidOperationException ex) when (ex.Message.Contains("maximum size"))
+        catch (InvalidOperationException ex) when (IsCapacityExceeded(ex))
         {
             throw new InvalidOperationException(
-                $"Storage capacity exceeded. Unable to save record (table: '{Name}', key: {key}, data size: {bytes.Length} bytes).", ex);
+                $"Storage capacity exceeded. Unable to save batch (table: '{Name}', count: {entries.Count}).", ex);
         }
+    }
+
+    public async Task SaveBatchAsync<T>(
+        IReadOnlyCollection<T> items,
+        Func<T, Guid> keySelector,
+        Func<T, byte[]> dataSelector,
+        Func<T, IReadOnlyDictionary<string, string>>? indexedFieldsSelector = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        ArgumentNullException.ThrowIfNull(keySelector);
+        ArgumentNullException.ThrowIfNull(dataSelector);
+        if (items.Count == 0)
+            throw new ArgumentException("Batch cannot be empty.", nameof(items));
+        var entries = new List<StorageWriteEntry>(items.Count);
+        foreach (var item in items)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Guid key = keySelector(item);
+            if (key == Guid.Empty)
+                throw new ArgumentException("Batch item key cannot be empty.", nameof(items));
+            byte[] data = dataSelector(item);
+            ArgumentNullException.ThrowIfNull(data);
+            if (data.Length == 0)
+                throw new ArgumentException("Batch item data cannot be empty.", nameof(items));
+            var indexedFields = indexedFieldsSelector?.Invoke(item) ?? new Dictionary<string, string>();
+            ArgumentNullException.ThrowIfNull(indexedFields);
+            entries.Add(new StorageWriteEntry(key, data, indexedFields));
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        await _engine.SaveBatchAsync(Name, entries, cancellationToken);
     }
 
     public async Task<StorageRecord?> GetAsync(Guid key, CancellationToken cancellationToken = default) =>
@@ -78,52 +157,41 @@ internal sealed class Table : ITable
             throw new ArgumentOutOfRangeException(nameof(skip), "Skip must be non-negative.");
         if (take < 0)
             throw new ArgumentOutOfRangeException(nameof(take), "Take must be non-negative.");
+        if (take == 0)
+            return [];
+
+        bool hasFilterField = !string.IsNullOrEmpty(filterField);
+        bool hasFilterValue = !string.IsNullOrEmpty(filterValue);
+        if (hasFilterField && !hasFilterValue)
+            throw new ArgumentException("filterValue is required when filterField is provided.", nameof(filterValue));
 
         // ── Fast path: use secondary index if available ──
-        if (!string.IsNullOrEmpty(filterField) && !string.IsNullOrEmpty(filterValue))
+        if (hasFilterField && hasFilterValue)
         {
-            var keys = await _engine.LookupByIndexAsync(Name, filterField, filterValue, cancellationToken);
+            var keys = await _engine.LookupByIndexAsync(Name, filterField!, filterValue!, cancellationToken);
             if (keys is not null)
             {
-                var result = new List<StorageRecord>();
-                int skipped = 0;
-
-                foreach (var key in keys)
-                {
-                    if (result.Count >= take) break;
-
-                    var record = await _engine.GetByKeyAsync(Name, key, cancellationToken);
-                    if (record is null) continue;
-
-                    if (skipped < skip)
-                    {
-                        skipped++;
-                        continue;
-                    }
-
-                    result.Add(record);
-                }
-
-                return result;
+                return await _engine.GetByKeysAsync(Name, keys, skip, take, cancellationToken);
             }
         }
 
-        // ── Slow path: full scan with text matching ──
-        if (string.IsNullOrEmpty(filterValue))
+        // ── No text filter: delegate to engine pagination ──
+        if (!hasFilterValue)
         {
             return await _engine.GetByTableAsync(Name, skip, take, cancellationToken);
         }
 
-        var all = await _engine.GetByTableAsync(Name, skip: 0, take: int.MaxValue, cancellationToken);
+        // ── Slow path: streaming full-scan with text matching (no full materialization) ──
         var filtered = new List<StorageRecord>();
         int skippedSlow = 0;
 
-        foreach (var record in all)
+        await foreach (var record in _engine.GetByTableStreamAsync(Name, cancellationToken))
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (filtered.Count >= take) break;
 
-            string text = Encoding.UTF8.GetString(record.Data);
-            if (!text.Contains(filterValue, StringComparison.OrdinalIgnoreCase))
+            if (!_recordContentFilter.IsMatch(record.Data, filterValue!))
                 continue;
 
             if (skippedSlow < skip)
@@ -142,25 +210,11 @@ internal sealed class Table : ITable
         string? filterValue = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var all = await _engine.GetByTableAsync(Name, skip: 0, take: int.MaxValue, cancellationToken);
-
-        if (string.IsNullOrEmpty(filterValue))
-        {
-            foreach (var record in all)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                yield return record;
-            }
-            yield break;
-        }
-
-        byte[] filterBytes = Encoding.UTF8.GetBytes(filterValue);
-
-        foreach (var record in all)
+        await foreach (var record in _engine.GetByTableStreamAsync(Name, cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (ContainsBytesOrdinalIgnoreCase(record.Data, filterBytes))
+            if (string.IsNullOrEmpty(filterValue) || _recordContentFilter.IsMatch(record.Data, filterValue))
             {
                 yield return record;
             }
@@ -204,34 +258,20 @@ internal sealed class Table : ITable
     public async Task<long> CountAsync(CancellationToken cancellationToken = default) =>
         await _engine.CountAsync(Name, cancellationToken);
 
-    // ── Private helpers ──
+    private static bool IsCapacityExceeded(InvalidOperationException ex) =>
+        ex.Message.Contains("maximum size", StringComparison.OrdinalIgnoreCase);
 
-    private static bool ContainsBytesOrdinalIgnoreCase(ReadOnlySpan<byte> source, ReadOnlySpan<byte> pattern)
+    public async Task DeleteBatchAsync(IEnumerable<Guid> keys, CancellationToken cancellationToken = default)
     {
-        if (pattern.IsEmpty) return true;
-        if (source.Length < pattern.Length) return false;
-
-        int end = source.Length - pattern.Length;
-        for (int i = 0; i <= end; i++)
-        {
-            if (EqualsIgnoreCaseAscii(source.Slice(i, pattern.Length), pattern))
-                return true;
-        }
-
-        return false;
+        ArgumentNullException.ThrowIfNull(keys);
+        await _engine.DeleteBatchAsync(Name, keys, cancellationToken).ConfigureAwait(false);
     }
 
-    private static bool EqualsIgnoreCaseAscii(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    public async Task DeleteBatchAsync<T>(IEnumerable<T> items, Func<T, Guid> keySelector, CancellationToken cancellationToken = default)
     {
-        for (int i = 0; i < b.Length; i++)
-        {
-            byte x = a[i], y = b[i];
-            if (x == y) continue;
-            if ((uint)((x | 0x20) - 'a') <= 'z' - 'a' && (x | 0x20) == (y | 0x20))
-                continue;
-            return false;
-        }
-
-        return true;
+        ArgumentNullException.ThrowIfNull(items);
+        ArgumentNullException.ThrowIfNull(keySelector);
+        var keys = items.Select(keySelector);
+        await DeleteBatchAsync(keys, cancellationToken).ConfigureAwait(false);
     }
 }

@@ -8,7 +8,9 @@ internal enum WalOperationType : byte
     Save = 1,
     Delete = 2,
     DropTable = 3,
-    TruncateTable = 4
+    TruncateTable = 4,
+    SaveBatch = 5,
+    DeleteBatch = 6 // batch delete operation
 }
 
 /// <summary>
@@ -21,7 +23,7 @@ internal readonly struct WalEntry
     public string Table { get; init; }
     public Guid Key { get; init; }
 
-    /// <summary>Data payload (only for Save operations).</summary>
+    /// <summary>Data payload (for Save or serialized batch payload for SaveBatch).</summary>
     public byte[] Data { get; init; }
 
     /// <summary>Positions recorded after applying to mmap (used for replay).</summary>
